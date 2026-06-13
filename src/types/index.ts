@@ -12,6 +12,7 @@ export interface Task {
   status: TaskStatus;
   dueDate: string;
   createdAt: string;
+  updatedAt?: string;
   completedAt?: string;
   estimatedMinutes: number;
   actualMinutes: number;

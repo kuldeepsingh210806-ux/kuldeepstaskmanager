@@ -58,13 +58,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     cloudPullUsers().then(cloudUsers => {
       if (!cloudUsers || cloudUsers.length === 0) return;
       const local = getUsers();
-      // Merge: add any cloud users not in local
       const localIds = new Set(local.map(u => u.id));
       const localMobiles = new Set(local.map(u => u.mobile));
       let merged = [...local];
       for (const cu of cloudUsers) {
         if (!localIds.has(cu.id) && !localMobiles.has(cu.mobile)) {
           merged.push(cu);
+        } else {
+          // Update existing user with cloud version if cloud is newer
+          const idx = merged.findIndex(u => u.id === cu.id || u.mobile === cu.mobile);
+          if (idx !== -1) {
+            const localUser = merged[idx];
+            const cloudNewer = cu.lastLoginAt && localUser.lastLoginAt
+              ? new Date(cu.lastLoginAt) > new Date(localUser.lastLoginAt)
+              : false;
+            if (cloudNewer) {
+              merged[idx] = { ...cu };
+            }
+          }
         }
       }
       saveUsers(merged);
@@ -97,14 +108,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       deviceId,
     };
 
-    // Save to localStorage (instant)
     users.push(newUser);
     saveUsers(users);
 
     // Cloud backup (fire and forget)
     cloudSyncUser(newUser);
 
-    // Login immediately
     const s: AuthSession = {
       userId: newUser.id, mobile: newUser.mobile, name: newUser.name,
       deviceId, loggedInAt: new Date().toISOString(), isAdmin: false,
@@ -115,7 +124,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return { success: true };
   }, [deviceId]);
 
-  // LOGIN — instant, no await
+  // LOGIN — works across devices, no device lock
   const login = useCallback((mobile: string, password: string): { success: boolean; error?: string } => {
     const trimMobile = mobile.trim();
     const trimPass = password.trim();
@@ -124,16 +133,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!/^\d{4}$/.test(trimPass)) return { success: false, error: 'Password must be exactly 4 digits' };
 
     const users = getUsers();
-    const user = users.find(u => u.mobile === trimMobile);
+    let user = users.find(u => u.mobile === trimMobile);
 
-    if (!user) return { success: false, error: 'No account found with this mobile number' };
-    if (user.password !== trimPass) return { success: false, error: 'Incorrect password' };
-
-    if (user.isLoggedIn && user.deviceId !== deviceId) {
-      return { success: false, error: 'Already logged in on another device. Logout from there first.' };
+    if (!user) {
+      // User not in local storage — try pulling from cloud first
+      cloudPullUsers().then(cloudUsers => {
+        if (!cloudUsers) return;
+        const local = getUsers();
+        const localIds = new Set(local.map(u => u.id));
+        const localMobiles = new Set(local.map(u => u.mobile));
+        let merged = [...local];
+        for (const cu of cloudUsers) {
+          if (!localIds.has(cu.id) && !localMobiles.has(cu.mobile)) merged.push(cu);
+        }
+        saveUsers(merged);
+      });
+      return { success: false, error: 'Account not found. Try again in a moment if you just registered on another device.' };
     }
 
-    // Update user (instant)
+    if (user.password !== trimPass) return { success: false, error: 'Incorrect password' };
+
+    // Update user — allow login from any device
     user.isLoggedIn = true;
     user.deviceId = deviceId;
     user.lastLoginAt = new Date().toISOString();

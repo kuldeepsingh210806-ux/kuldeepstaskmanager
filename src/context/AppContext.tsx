@@ -23,6 +23,24 @@ function lsSet(key: string, val: any) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
 }
 
+// Merge two arrays by id, keeping the most recently updated item for conflicts
+function mergeById<T extends { id: string; updatedAt?: string; createdAt?: string }>(local: T[], cloud: T[]): T[] {
+  const map = new Map<string, T>();
+  for (const item of local) map.set(item.id, item);
+  for (const item of cloud) {
+    const existing = map.get(item.id);
+    if (!existing) {
+      map.set(item.id, item);
+    } else {
+      // Prefer whichever has a newer updatedAt/createdAt
+      const existingDate = existing.updatedAt || existing.createdAt || '';
+      const cloudDate = item.updatedAt || item.createdAt || '';
+      if (cloudDate > existingDate) map.set(item.id, item);
+    }
+  }
+  return Array.from(map.values());
+}
+
 interface AppContextType {
   currentView: ViewType;
   setCurrentView: (view: ViewType) => void;
@@ -73,30 +91,40 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // Debounced cloud sync — fires 3s after last change
   const scheduleCloudSync = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current);
+    setSyncStatus('syncing');
     timerRef.current = setTimeout(() => {
-      setSyncStatus('syncing');
       const s = stateRef.current;
       cloudSyncAppData(uid, s);
-      // Assume success after short delay (fire-and-forget)
-      setTimeout(() => setSyncStatus('synced'), 500);
+      setTimeout(() => setSyncStatus('synced'), 800);
     }, 3000);
   }, [uid]);
 
-  // Background: pull cloud data once on mount and merge if richer
+  // Pull cloud data on mount — merge properly by ID so cross-device data is preserved
   useEffect(() => {
+    if (!uid || uid === 'guest') return;
     cloudPullAppData(uid).then(cloud => {
       if (!cloud) return;
+
       const localTasks: Task[] = ls(tK) || [];
       const localSessions: StudySession[] = ls(sK) || [];
-      if (cloud.tasks?.length > localTasks.length) {
-        setTasks(cloud.tasks);
-        lsSet(tK, cloud.tasks);
+      const localSettings = ls(stK);
+
+      // Merge tasks and sessions by id — keeps all unique items from both devices
+      const mergedTasks = mergeById(localTasks, cloud.tasks || []);
+      const mergedSessions = mergeById(localSessions, cloud.sessions || []);
+
+      // Update state and localStorage with merged data
+      if (mergedTasks.length !== localTasks.length ||
+          JSON.stringify(mergedTasks) !== JSON.stringify(localTasks)) {
+        setTasks(mergedTasks);
+        lsSet(tK, mergedTasks);
       }
-      if (cloud.sessions?.length > localSessions.length) {
-        setSessions(cloud.sessions);
-        lsSet(sK, cloud.sessions);
+      if (mergedSessions.length !== localSessions.length ||
+          JSON.stringify(mergedSessions) !== JSON.stringify(localSessions)) {
+        setSessions(mergedSessions);
+        lsSet(sK, mergedSessions);
       }
-      if (cloud.settings && !ls(stK)) {
+      if (cloud.settings && !localSettings) {
         setSettingsState(cloud.settings);
         lsSet(stK, cloud.settings);
       }
@@ -115,7 +143,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [scheduleCloudSync]);
 
   const updateTask = useCallback((id: string, u: Partial<Task>) => {
-    setTasks(p => p.map(t => t.id === id ? { ...t, ...u } : t)); scheduleCloudSync();
+    setTasks(p => p.map(t => t.id === id ? { ...t, ...u, updatedAt: new Date().toISOString() } : t));
+    scheduleCloudSync();
   }, [scheduleCloudSync]);
 
   const deleteTask = useCallback((id: string) => {
@@ -126,29 +155,35 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setTasks(p => p.map(t => {
       if (t.id !== id) return t;
       return t.status === 'completed'
-        ? { ...t, status: 'todo' as const, completedAt: undefined }
-        : { ...t, status: 'completed' as const, completedAt: new Date().toISOString() };
+        ? { ...t, status: 'todo' as const, completedAt: undefined, updatedAt: new Date().toISOString() }
+        : { ...t, status: 'completed' as const, completedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     }));
     scheduleCloudSync();
   }, [scheduleCloudSync]);
 
   const toggleSubtask = useCallback((taskId: string, subtaskId: string) => {
     setTasks(p => p.map(t => t.id !== taskId ? t : {
-      ...t, subtasks: t.subtasks.map(s => s.id === subtaskId ? { ...s, completed: !s.completed } : s)
+      ...t,
+      updatedAt: new Date().toISOString(),
+      subtasks: t.subtasks.map(s => s.id === subtaskId ? { ...s, completed: !s.completed } : s)
     }));
     scheduleCloudSync();
   }, [scheduleCloudSync]);
 
   const addSubtask = useCallback((taskId: string, title: string) => {
     setTasks(p => p.map(t => t.id !== taskId ? t : {
-      ...t, subtasks: [...t.subtasks, { id: uuidv4(), title, completed: false }]
+      ...t,
+      updatedAt: new Date().toISOString(),
+      subtasks: [...t.subtasks, { id: uuidv4(), title, completed: false }]
     }));
     scheduleCloudSync();
   }, [scheduleCloudSync]);
 
   const deleteSubtask = useCallback((taskId: string, subtaskId: string) => {
     setTasks(p => p.map(t => t.id !== taskId ? t : {
-      ...t, subtasks: t.subtasks.filter(s => s.id !== subtaskId)
+      ...t,
+      updatedAt: new Date().toISOString(),
+      subtasks: t.subtasks.filter(s => s.id !== subtaskId)
     }));
     scheduleCloudSync();
   }, [scheduleCloudSync]);
