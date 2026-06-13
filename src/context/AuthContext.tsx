@@ -64,7 +64,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const isAdmin = session?.isAdmin || false;
   const deviceId = getDeviceId();
 
-  // Validate session on mount
   useEffect(() => {
     let mounted = true;
     async function validateSession() {
@@ -72,15 +71,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (saved && !saved.isAdmin) {
         try {
           const user = await DB.getUserById(saved.userId);
-          if (mounted) {
-            if (!user || user.deviceId !== deviceId) {
-              setSession(null);
-              saveLocalSession(null);
-            }
+          if (mounted && (!user || user.deviceId !== deviceId)) {
+            setSession(null);
+            saveLocalSession(null);
           }
-        } catch (err) {
-          console.error('[Auth] Session validation failed:', err);
-          // Keep session if Firebase unreachable (offline tolerance)
+        } catch {
+          // Keep session if offline
         }
       }
       if (mounted) setIsLoading(false);
@@ -100,7 +96,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!/^\d{4}$/.test(trimPass)) return { success: false, error: 'Password must be exactly 4 digits' };
 
     try {
-      const existing = await DB.getUserByMobile(trimMobile);
+      // Check if mobile already exists
+      let existing: User | null = null;
+      try {
+        existing = await DB.getUserByMobile(trimMobile);
+      } catch (checkErr: any) {
+        // If checking fails, it's a connection/permission issue
+        return {
+          success: false,
+          error: `Cannot connect to database (${checkErr?.code || checkErr?.message || 'unknown'}). Make sure Firestore is enabled and rules allow access.`
+        };
+      }
+
       if (existing) {
         return { success: false, error: 'This mobile number is already registered' };
       }
@@ -116,7 +123,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         deviceId: deviceId,
       };
 
-      await DB.createUser(newUser);
+      try {
+        await DB.createUser(newUser);
+      } catch (writeErr: any) {
+        return {
+          success: false,
+          error: `Failed to save user (${writeErr?.code || writeErr?.message || 'unknown'}). Check Firestore rules allow writes.`
+        };
+      }
 
       const newSession: AuthSession = {
         userId: newUser.id,
@@ -131,13 +145,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       return { success: true };
     } catch (err: any) {
-      console.error('[Auth] Register error:', err);
-      const msg = err?.code === 'permission-denied'
-        ? 'Database permission denied. Please check Firestore security rules.'
-        : err?.code === 'unavailable'
-          ? 'Cannot reach database. Check your internet connection.'
-          : `Registration failed: ${err?.message || 'Unknown error'}`;
-      return { success: false, error: msg };
+      return { success: false, error: `Unexpected error: ${err?.code || err?.message || String(err)}` };
     }
   }, [deviceId]);
 
@@ -149,20 +157,35 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!/^\d{4}$/.test(trimPass)) return { success: false, error: 'Password must be exactly 4 digits' };
 
     try {
-      const user = await DB.getUserByMobile(trimMobile);
+      let user: User | null = null;
+      try {
+        user = await DB.getUserByMobile(trimMobile);
+      } catch (findErr: any) {
+        return {
+          success: false,
+          error: `Cannot connect to database (${findErr?.code || findErr?.message || 'unknown'}). Check internet and Firestore rules.`
+        };
+      }
 
       if (!user) return { success: false, error: 'No account found with this mobile number' };
       if (user.password !== trimPass) return { success: false, error: 'Incorrect password' };
 
       if (user.isLoggedIn && user.deviceId !== deviceId) {
-        return { success: false, error: 'You are already logged in on another device. Please logout from there first.' };
+        return { success: false, error: 'Already logged in on another device. Logout from there first.' };
       }
 
-      await DB.updateUser(user.id, {
-        isLoggedIn: true,
-        deviceId: deviceId,
-        lastLoginAt: new Date().toISOString(),
-      });
+      try {
+        await DB.updateUser(user.id, {
+          isLoggedIn: true,
+          deviceId: deviceId,
+          lastLoginAt: new Date().toISOString(),
+        });
+      } catch (updateErr: any) {
+        return {
+          success: false,
+          error: `Login matched but failed to update session (${updateErr?.code || updateErr?.message || 'unknown'}).`
+        };
+      }
 
       const newSession: AuthSession = {
         userId: user.id,
@@ -177,13 +200,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       return { success: true };
     } catch (err: any) {
-      console.error('[Auth] Login error:', err);
-      const msg = err?.code === 'permission-denied'
-        ? 'Database permission denied. Please check Firestore security rules.'
-        : err?.code === 'unavailable'
-          ? 'Cannot reach database. Check your internet connection.'
-          : `Login failed: ${err?.message || 'Unknown error'}`;
-      return { success: false, error: msg };
+      return { success: false, error: `Unexpected error: ${err?.code || err?.message || String(err)}` };
     }
   }, [deviceId]);
 
@@ -191,7 +208,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (passkey !== ADMIN_PASSKEY) {
       return { success: false, error: 'Invalid admin passkey' };
     }
-
     const newSession: AuthSession = {
       userId: 'admin',
       mobile: '',
@@ -202,17 +218,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
     setSession(newSession);
     saveLocalSession(newSession);
-
     return { success: true };
   }, [deviceId]);
 
   const logout = useCallback(async () => {
     if (session && !session.isAdmin) {
-      try {
-        await DB.updateUser(session.userId, { isLoggedIn: false });
-      } catch (err) {
-        console.error('[Auth] Logout update failed:', err);
-      }
+      try { await DB.updateUser(session.userId, { isLoggedIn: false }); } catch {}
     }
     setSession(null);
     saveLocalSession(null);

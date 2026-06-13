@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useCallback, useMemo, useState, useEffect } from 'react';
+import React, { createContext, useContext, useCallback, useMemo, useState, useEffect, useRef } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { useAuth } from './AuthContext';
 import * as DB from '../services/database';
@@ -7,23 +7,28 @@ import type { Task, StudySession, AppSettings, ViewType, Subtask } from '../type
 const defaultSettings: AppSettings = {
   theme: 'dark',
   timer: {
-    workDuration: 25,
-    shortBreakDuration: 5,
-    longBreakDuration: 15,
-    sessionsBeforeLongBreak: 4,
-    autoStartBreaks: false,
-    autoStartWork: false,
-    soundEnabled: true,
+    workDuration: 25, shortBreakDuration: 5, longBreakDuration: 15,
+    sessionsBeforeLongBreak: 4, autoStartBreaks: false, autoStartWork: false, soundEnabled: true,
   },
   categories: ['Mathematics', 'Science', 'English', 'History', 'Programming', 'Art', 'Music', 'Other'],
   dailyGoalMinutes: 120,
   weeklyGoalHours: 14,
 };
 
+// ---- Local cache helpers ----
+function loadLocal<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch { return fallback; }
+}
+function saveLocal(key: string, value: unknown) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+}
+
 interface AppContextType {
   currentView: ViewType;
   setCurrentView: (view: ViewType) => void;
-
   tasks: Task[];
   addTask: (task: Omit<Task, 'id' | 'createdAt' | 'actualMinutes' | 'subtasks'> & { subtasks?: Subtask[] }) => void;
   updateTask: (id: string, updates: Partial<Task>) => void;
@@ -32,18 +37,15 @@ interface AppContextType {
   toggleSubtask: (taskId: string, subtaskId: string) => void;
   addSubtask: (taskId: string, title: string) => void;
   deleteSubtask: (taskId: string, subtaskId: string) => void;
-
   sessions: StudySession[];
   addSession: (session: Omit<StudySession, 'id'>) => void;
-
   settings: AppSettings;
   updateSettings: (updates: Partial<AppSettings>) => void;
-
   getTodayStudyMinutes: () => number;
   getWeekStudyHours: () => number;
   getStreak: () => number;
-
   isDataLoading: boolean;
+  syncStatus: 'synced' | 'syncing' | 'offline';
 }
 
 const AppContext = createContext<AppContextType | null>(null);
@@ -52,139 +54,196 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const { session } = useAuth();
   const userId = session?.userId || 'guest';
 
-  const [currentView, setCurrentViewState] = useState<ViewType>('dashboard');
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [sessions, setSessions] = useState<StudySession[]>([]);
-  const [settings, setSettingsState] = useState<AppSettings>(defaultSettings);
-  const [isDataLoading, setIsDataLoading] = useState(true);
+  // Keys for localStorage cache
+  const tKey = `sf-tasks-${userId}`;
+  const sKey = `sf-sessions-${userId}`;
+  const stKey = `sf-settings-${userId}`;
+  const vKey = `sf-view-${userId}`;
 
-  // Load all data from Firestore on mount / user change
+  // State — initialized from localStorage (INSTANT)
+  const [currentView, setCurrentViewState] = useState<ViewType>(() => loadLocal(vKey, 'dashboard'));
+  const [tasks, setTasks] = useState<Task[]>(() => loadLocal(tKey, []));
+  const [sessions, setSessions] = useState<StudySession[]>(() => loadLocal(sKey, []));
+  const [settings, setSettingsState] = useState<AppSettings>(() => loadLocal(stKey, defaultSettings));
+  const [isDataLoading, setIsDataLoading] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'offline'>('synced');
+
+  // Track if we need to sync to cloud
+  const dirtyRef = useRef(false);
+  const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ---- SAVE TO LOCAL (instant) + mark dirty for cloud sync ----
+  const markDirty = useCallback(() => {
+    dirtyRef.current = true;
+    // Debounce: sync to cloud after 2 seconds of inactivity
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(() => {
+      syncToCloud();
+    }, 2000);
+  }, []);
+
+  // Ref to always have latest state for the sync function
+  const stateRef = useRef({ tasks, sessions, settings, currentView });
+  useEffect(() => {
+    stateRef.current = { tasks, sessions, settings, currentView };
+    // Save to localStorage on every change (instant, no latency)
+    saveLocal(tKey, tasks);
+    saveLocal(sKey, sessions);
+    saveLocal(stKey, settings);
+    saveLocal(vKey, currentView);
+  }, [tasks, sessions, settings, currentView, tKey, sKey, stKey, vKey]);
+
+  // ---- CLOUD SYNC (background, debounced) ----
+  const syncToCloud = useCallback(async () => {
+    if (!dirtyRef.current) return;
+    dirtyRef.current = false;
+    setSyncStatus('syncing');
+    try {
+      const s = stateRef.current;
+      await DB.saveUserAppData(userId, {
+        tasks: s.tasks,
+        sessions: s.sessions,
+        settings: s.settings,
+        currentView: s.currentView,
+      });
+      setSyncStatus('synced');
+    } catch {
+      setSyncStatus('offline');
+      dirtyRef.current = true; // retry next time
+    }
+  }, [userId]);
+
+  // ---- INITIAL LOAD: show local cache instantly, fetch cloud in background ----
   useEffect(() => {
     let cancelled = false;
-    async function loadData() {
+    async function loadFromCloud() {
       setIsDataLoading(true);
       try {
-        const [dbTasks, dbSessions, dbSettings, dbView] = await Promise.all([
-          DB.getUserTasks(userId),
-          DB.getUserSessions(userId),
-          DB.getUserSettings(userId),
-          DB.getUserView(userId),
-        ]);
-        if (cancelled) return;
-        setTasks(dbTasks);
-        setSessions(dbSessions);
-        if (dbSettings) setSettingsState(dbSettings);
-        if (dbView) setCurrentViewState(dbView as ViewType);
-      } catch (err) {
-        console.error('Failed to load data:', err);
+        const cloud = await DB.loadUserAppData(userId);
+        if (cancelled || !cloud) {
+          setIsDataLoading(false);
+          return;
+        }
+        // Merge strategy: cloud wins if it has more data, otherwise keep local
+        const localTasks: Task[] = loadLocal(tKey, []);
+        const localSessions: StudySession[] = loadLocal(sKey, []);
+
+        // Use cloud if it exists and has data, otherwise keep local
+        const finalTasks = cloud.tasks.length >= localTasks.length ? cloud.tasks : localTasks;
+        const finalSessions = cloud.sessions.length >= localSessions.length ? cloud.sessions : localSessions;
+        const finalSettings = cloud.settings || loadLocal(stKey, defaultSettings);
+        const finalView = cloud.currentView || loadLocal(vKey, 'dashboard');
+
+        setTasks(finalTasks);
+        setSessions(finalSessions);
+        setSettingsState(finalSettings);
+        setCurrentViewState(finalView);
+
+        // Save merged data to local
+        saveLocal(tKey, finalTasks);
+        saveLocal(sKey, finalSessions);
+        saveLocal(stKey, finalSettings);
+        saveLocal(vKey, finalView);
+      } catch {
+        // Cloud failed — that's ok, local data is already loaded
+        setSyncStatus('offline');
       }
       if (!cancelled) setIsDataLoading(false);
     }
-    loadData();
+    loadFromCloud();
     return () => { cancelled = true; };
+  }, [userId, tKey, sKey, stKey, vKey]);
+
+  // Sync to cloud before page unload
+  useEffect(() => {
+    const handleUnload = () => {
+      if (dirtyRef.current) {
+        const s = stateRef.current;
+        // Use sendBeacon for reliable last-chance sync
+        // Fall back: at least local is saved
+        try {
+          DB.saveUserAppData(userId, {
+            tasks: s.tasks, sessions: s.sessions,
+            settings: s.settings, currentView: s.currentView,
+          });
+        } catch {}
+      }
+    };
+    window.addEventListener('beforeunload', handleUnload);
+    return () => window.removeEventListener('beforeunload', handleUnload);
   }, [userId]);
 
-  // View
+  // ---- STATE SETTERS (instant local + background cloud) ----
   const setCurrentView = useCallback((view: ViewType) => {
     setCurrentViewState(view);
-    DB.setUserView(userId, view).catch(console.error);
-  }, [userId]);
+    markDirty();
+  }, [markDirty]);
 
-  // Tasks
   const addTask = useCallback((task: Omit<Task, 'id' | 'createdAt' | 'actualMinutes' | 'subtasks'> & { subtasks?: Subtask[] }) => {
     const newTask: Task = {
-      ...task,
-      id: uuidv4(),
-      createdAt: new Date().toISOString(),
-      actualMinutes: 0,
-      subtasks: task.subtasks || [],
+      ...task, id: uuidv4(), createdAt: new Date().toISOString(),
+      actualMinutes: 0, subtasks: task.subtasks || [],
     };
     setTasks(prev => [newTask, ...prev]);
-    DB.setUserTask(userId, newTask).catch(console.error);
-  }, [userId]);
+    markDirty();
+  }, [markDirty]);
 
   const updateTask = useCallback((id: string, updates: Partial<Task>) => {
-    setTasks(prev => {
-      const updated = prev.map(t => t.id === id ? { ...t, ...updates } : t);
-      const task = updated.find(t => t.id === id);
-      if (task) DB.setUserTask(userId, task).catch(console.error);
-      return updated;
-    });
-  }, [userId]);
+    setTasks(prev => prev.map(t => t.id === id ? { ...t, ...updates } : t));
+    markDirty();
+  }, [markDirty]);
 
   const deleteTask = useCallback((id: string) => {
     setTasks(prev => prev.filter(t => t.id !== id));
-    DB.deleteUserTask(userId, id).catch(console.error);
-  }, [userId]);
+    markDirty();
+  }, [markDirty]);
 
   const toggleTaskStatus = useCallback((id: string) => {
-    setTasks(prev => {
-      const updated = prev.map(t => {
-        if (t.id !== id) return t;
-        if (t.status === 'completed') {
-          return { ...t, status: 'todo' as const, completedAt: undefined };
-        }
-        return { ...t, status: 'completed' as const, completedAt: new Date().toISOString() };
-      });
-      const task = updated.find(t => t.id === id);
-      if (task) DB.setUserTask(userId, task).catch(console.error);
-      return updated;
-    });
-  }, [userId]);
+    setTasks(prev => prev.map(t => {
+      if (t.id !== id) return t;
+      return t.status === 'completed'
+        ? { ...t, status: 'todo' as const, completedAt: undefined }
+        : { ...t, status: 'completed' as const, completedAt: new Date().toISOString() };
+    }));
+    markDirty();
+  }, [markDirty]);
 
   const toggleSubtask = useCallback((taskId: string, subtaskId: string) => {
-    setTasks(prev => {
-      const updated = prev.map(t => {
-        if (t.id !== taskId) return t;
-        return { ...t, subtasks: t.subtasks.map(s => s.id === subtaskId ? { ...s, completed: !s.completed } : s) };
-      });
-      const task = updated.find(t => t.id === taskId);
-      if (task) DB.setUserTask(userId, task).catch(console.error);
-      return updated;
-    });
-  }, [userId]);
+    setTasks(prev => prev.map(t => {
+      if (t.id !== taskId) return t;
+      return { ...t, subtasks: t.subtasks.map(s => s.id === subtaskId ? { ...s, completed: !s.completed } : s) };
+    }));
+    markDirty();
+  }, [markDirty]);
 
   const addSubtask = useCallback((taskId: string, title: string) => {
-    setTasks(prev => {
-      const updated = prev.map(t => {
-        if (t.id !== taskId) return t;
-        return { ...t, subtasks: [...t.subtasks, { id: uuidv4(), title, completed: false }] };
-      });
-      const task = updated.find(t => t.id === taskId);
-      if (task) DB.setUserTask(userId, task).catch(console.error);
-      return updated;
-    });
-  }, [userId]);
+    setTasks(prev => prev.map(t => {
+      if (t.id !== taskId) return t;
+      return { ...t, subtasks: [...t.subtasks, { id: uuidv4(), title, completed: false }] };
+    }));
+    markDirty();
+  }, [markDirty]);
 
   const deleteSubtask = useCallback((taskId: string, subtaskId: string) => {
-    setTasks(prev => {
-      const updated = prev.map(t => {
-        if (t.id !== taskId) return t;
-        return { ...t, subtasks: t.subtasks.filter(s => s.id !== subtaskId) };
-      });
-      const task = updated.find(t => t.id === taskId);
-      if (task) DB.setUserTask(userId, task).catch(console.error);
-      return updated;
-    });
-  }, [userId]);
+    setTasks(prev => prev.map(t => {
+      if (t.id !== taskId) return t;
+      return { ...t, subtasks: t.subtasks.filter(s => s.id !== subtaskId) };
+    }));
+    markDirty();
+  }, [markDirty]);
 
-  // Sessions
   const addSession = useCallback((session: Omit<StudySession, 'id'>) => {
     const newSession: StudySession = { ...session, id: uuidv4() };
     setSessions(prev => [newSession, ...prev]);
-    DB.addUserSession(userId, newSession).catch(console.error);
-  }, [userId]);
+    markDirty();
+  }, [markDirty]);
 
-  // Settings
   const updateSettings = useCallback((updates: Partial<AppSettings>) => {
-    setSettingsState(prev => {
-      const updated = { ...prev, ...updates };
-      DB.setUserSettings(userId, updated).catch(console.error);
-      return updated;
-    });
-  }, [userId]);
+    setSettingsState(prev => ({ ...prev, ...updates }));
+    markDirty();
+  }, [markDirty]);
 
-  // Stats
+  // ---- STATS ----
   const getTodayStudyMinutes = useCallback(() => {
     const today = new Date().toDateString();
     return sessions
@@ -193,8 +252,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [sessions]);
 
   const getWeekStudyHours = useCallback(() => {
-    const now = new Date();
-    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const weekAgo = new Date(Date.now() - 7 * 86400000);
     return sessions
       .filter(s => new Date(s.startTime) >= weekAgo && s.type === 'work' && s.completed)
       .reduce((acc, s) => acc + s.duration / 3600, 0);
@@ -207,12 +265,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     let streak = 0;
     const today = new Date();
     for (let i = 0; i < 365; i++) {
-      const checkDate = new Date(today.getTime() - i * 24 * 60 * 60 * 1000);
-      if (dates.has(checkDate.toDateString())) {
-        streak++;
-      } else if (i > 0) {
-        break;
-      }
+      const d = new Date(today.getTime() - i * 86400000);
+      if (dates.has(d.toDateString())) streak++;
+      else if (i > 0) break;
     }
     return streak;
   }, [sessions]);
@@ -223,8 +278,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     sessions, addSession,
     settings, updateSettings,
     getTodayStudyMinutes, getWeekStudyHours, getStreak,
-    isDataLoading,
-  }), [currentView, setCurrentView, tasks, addTask, updateTask, deleteTask, toggleTaskStatus, toggleSubtask, addSubtask, deleteSubtask, sessions, addSession, settings, updateSettings, getTodayStudyMinutes, getWeekStudyHours, getStreak, isDataLoading]);
+    isDataLoading, syncStatus,
+  }), [currentView, setCurrentView, tasks, addTask, updateTask, deleteTask, toggleTaskStatus,
+    toggleSubtask, addSubtask, deleteSubtask, sessions, addSession, settings, updateSettings,
+    getTodayStudyMinutes, getWeekStudyHours, getStreak, isDataLoading, syncStatus]);
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

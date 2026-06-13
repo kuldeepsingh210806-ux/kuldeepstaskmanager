@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { cn } from '../../utils/cn';
+import { testFirestoreConnection } from '../../services/database';
 import {
   GraduationCap,
   User,
@@ -12,7 +13,8 @@ import {
   ArrowLeft,
   AlertCircle,
   CheckCircle2,
-  Sparkles,
+  WifiOff,
+  Loader2,
 } from 'lucide-react';
 
 export default function RegisterPage() {
@@ -24,9 +26,18 @@ export default function RegisterPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [dbStatus, setDbStatus] = useState<'checking' | 'connected' | 'error'>('checking');
   const nameRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    async function checkDb() {
+      const result = await testFirestoreConnection();
+      setDbStatus(result.ok ? 'connected' : 'error');
+      if (!result.ok) {
+        setError(`Database error: ${result.error}. Go back to login page to see fix instructions.`);
+      }
+    }
+    checkDb();
     nameRef.current?.focus();
   }, []);
 
@@ -45,8 +56,8 @@ export default function RegisterPage() {
       if (!result.success) {
         setError(result.error || 'Registration failed');
       }
-    } catch {
-      setError('Connection error. Please try again.');
+    } catch (err: any) {
+      setError(`Connection error: ${err?.message || 'Please try again.'}`);
     } finally {
       setIsLoading(false);
     }
@@ -64,7 +75,7 @@ export default function RegisterPage() {
     setError('');
   };
 
-  const isValid = name.trim().length >= 2 && mobile.length === 10 && password.length === 4 && confirmPassword.length === 4;
+  const isValid = name.trim().length >= 2 && mobile.length === 10 && password.length === 4 && confirmPassword.length === 4 && password === confirmPassword;
 
   const validations = [
     { label: 'Full name (at least 2 characters)', valid: name.trim().length >= 2 },
@@ -100,6 +111,14 @@ export default function RegisterPage() {
           <h1 className="text-3xl font-bold text-white tracking-tight">Create Account</h1>
           <p className="text-slate-400 text-sm mt-1">Join StudyFlow and start tracking your studies</p>
         </div>
+
+        {/* DB Status Banner */}
+        {dbStatus === 'error' && (
+          <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-xl flex items-center gap-2">
+            <WifiOff size={14} className="text-red-400 flex-shrink-0" />
+            <p className="text-xs text-red-300">Database offline — go back to login page for fix instructions</p>
+          </div>
+        )}
 
         {/* Registration Card */}
         <div className="bg-slate-900/80 backdrop-blur-xl rounded-3xl border border-white/10 shadow-2xl shadow-black/40 p-8 animate-fade-in" style={{ animationDelay: '0.1s' }}>
@@ -166,7 +185,6 @@ export default function RegisterPage() {
                   {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>
-              {/* PIN dots */}
               <div className="flex justify-center gap-3 mt-2.5">
                 {[0, 1, 2, 3].map(i => (
                   <div
@@ -231,17 +249,17 @@ export default function RegisterPage() {
             {error && (
               <div className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/20 rounded-xl animate-fade-in">
                 <AlertCircle size={16} className="text-red-400 flex-shrink-0 mt-0.5" />
-                <p className="text-xs text-red-300">{error}</p>
+                <p className="text-xs text-red-300 break-all">{error}</p>
               </div>
             )}
 
             {/* Register Button */}
             <button
               type="submit"
-              disabled={isLoading || !isValid}
+              disabled={isLoading || !isValid || dbStatus === 'error'}
               className={cn(
                 'w-full flex items-center justify-center gap-2 py-3.5 rounded-xl text-sm font-semibold transition-all duration-300',
-                isValid
+                isValid && dbStatus !== 'error'
                   ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-lg shadow-emerald-500/25 hover:shadow-emerald-500/40 hover:from-emerald-500 hover:to-teal-500'
                   : 'bg-slate-800/60 text-slate-500 cursor-not-allowed'
               )}
@@ -271,12 +289,17 @@ export default function RegisterPage() {
           </div>
         </div>
 
-        {/* Footer */}
+        {/* Footer with DB status */}
         <div className="text-center mt-6">
-          <p className="text-[11px] text-slate-600 flex items-center justify-center gap-1">
-            <Sparkles size={10} />
-            Your data stays secure on your device
-          </p>
+          <div className="inline-flex items-center gap-1.5 text-[11px]">
+            {dbStatus === 'checking' ? (
+              <><Loader2 size={10} className="text-slate-500 animate-spin" /><span className="text-slate-500">Connecting to database...</span></>
+            ) : dbStatus === 'connected' ? (
+              <><CheckCircle2 size={10} className="text-emerald-500" /><span className="text-emerald-500/70">Cloud database connected</span></>
+            ) : (
+              <><WifiOff size={10} className="text-red-500" /><span className="text-red-500/70">Database offline — fix rules first</span></>
+            )}
+          </div>
         </div>
       </div>
     </div>

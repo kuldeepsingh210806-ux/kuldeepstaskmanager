@@ -26,7 +26,7 @@ const navItems: { view: ViewType; label: string; icon: React.ReactNode }[] = [
 ];
 
 export default function Sidebar() {
-  const { currentView, setCurrentView, getTodayStudyMinutes, settings } = useApp();
+  const { currentView, setCurrentView, getTodayStudyMinutes, settings, syncStatus } = useApp();
   const { session, logout } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
@@ -104,6 +104,17 @@ export default function Sidebar() {
         </div>
         {goalProgress >= 100 && (
           <p className="text-xs text-emerald-400 mt-1.5 font-medium">🎉 Goal reached!</p>
+        )}
+      </div>
+
+      {/* Sync Status */}
+      <div className="px-4 py-2 flex items-center gap-1.5 text-[10px]">
+        {syncStatus === 'syncing' ? (
+          <><div className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" /><span className="text-amber-400/70">Syncing...</span></>
+        ) : syncStatus === 'synced' ? (
+          <><div className="w-1.5 h-1.5 rounded-full bg-emerald-400" /><span className="text-slate-500">Cloud synced</span></>
+        ) : (
+          <><div className="w-1.5 h-1.5 rounded-full bg-red-400" /><span className="text-red-400/70">Offline</span></>
         )}
       </div>
 

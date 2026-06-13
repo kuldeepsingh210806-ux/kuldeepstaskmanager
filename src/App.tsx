@@ -24,30 +24,7 @@ function SplashScreen() {
         </div>
       </div>
       <h1 className="text-2xl font-bold text-white mb-2">StudyFlow</h1>
-      <p className="text-sm text-slate-400">Loading your study data...</p>
-      <div className="mt-6 flex gap-1.5">
-        {[0, 1, 2].map(i => (
-          <div
-            key={i}
-            className="w-2 h-2 rounded-full bg-violet-500 animate-pulse"
-            style={{ animationDelay: `${i * 0.15}s` }}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function DataLoadingOverlay() {
-  const { isDataLoading } = useApp();
-  if (!isDataLoading) return null;
-  return (
-    <div className="fixed inset-0 z-[100] bg-[#0B0F19] flex flex-col items-center justify-center">
-      <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center shadow-2xl shadow-violet-500/30 mb-5">
-        <GraduationCap size={32} className="text-white" />
-      </div>
-      <Loader2 size={20} className="text-violet-400 animate-spin mb-3" />
-      <p className="text-sm text-slate-400">Syncing your data from cloud...</p>
+      <p className="text-sm text-slate-400">Checking session...</p>
     </div>
   );
 }
@@ -55,26 +32,17 @@ function DataLoadingOverlay() {
 function AuthGate() {
   const { isAuthenticated, isAdmin, authPage, isLoading } = useAuth();
 
-  // Show splash while validating session
-  if (isLoading) {
-    return <SplashScreen />;
-  }
+  if (isLoading) return <SplashScreen />;
 
-  // Not logged in — show auth pages
   if (!isAuthenticated) {
     if (authPage === 'register') return <RegisterPage />;
     return <LoginPage />;
   }
 
-  // Admin logged in — show admin panel
-  if (isAdmin) {
-    return <AdminPanel />;
-  }
+  if (isAdmin) return <AdminPanel />;
 
-  // Normal user — show app with user-scoped cloud data
   return (
     <AppProvider>
-      <DataLoadingOverlay />
       <MainApp />
     </AppProvider>
   );

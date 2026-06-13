@@ -1,8 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { cn } from '../../utils/cn';
-import { db } from '../../firebase';
-import { collection, getDocs, limit, query } from 'firebase/firestore';
+import { testFirestoreConnection } from '../../services/database';
 import {
   GraduationCap,
   Phone,
@@ -35,27 +34,25 @@ export default function LoginPage() {
 
   // Test Firebase connection on mount
   useEffect(() => {
-    async function testConnection() {
-      try {
-        // Try to read from Firestore to verify connection + rules
-        const q2 = query(collection(db, 'users'), limit(1));
-        await getDocs(q2);
+    async function checkDb() {
+      const result = await testFirestoreConnection();
+      if (result.ok) {
         setDbStatus('connected');
-      } catch (err: any) {
-        console.error('[Firebase Test] Connection failed:', err);
+      } else {
         setDbStatus('error');
-        if (err?.code === 'permission-denied') {
-          setDbError('Firestore rules are blocking access. Go to Firebase Console → Firestore → Rules → set to test mode.');
-        } else if (err?.code === 'unavailable') {
-          setDbError('Cannot reach Firebase. Check internet connection.');
-        } else if (err?.message?.includes('projectId')) {
-          setDbError('Firebase project not found. Check your config.');
+        const code = result.error || '';
+        if (code.includes('permission-denied')) {
+          setDbError('Firestore rules are blocking access. Update rules to allow read/write.');
+        } else if (code.includes('unavailable') || code.includes('Failed to fetch')) {
+          setDbError('Cannot reach Firebase. Check your internet connection.');
+        } else if (code.includes('not-found') || code.includes('NOT_FOUND')) {
+          setDbError('Firestore database not created yet. Go to Firebase Console → Build → Firestore Database → Create database.');
         } else {
-          setDbError(err?.message || 'Unknown Firebase error');
+          setDbError(code || 'Unknown connection error');
         }
       }
     }
-    testConnection();
+    checkDb();
     mobileRef.current?.focus();
   }, []);
 
