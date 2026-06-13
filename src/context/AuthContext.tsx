@@ -1,37 +1,29 @@
 import React, { createContext, useContext, useState, useCallback, useMemo, useEffect } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import type { User, AuthSession, Task, StudySession } from '../types';
-import * as DB from '../services/database';
+import { cloudSyncUser, cloudDeleteUser, cloudPullUsers } from '../services/database';
 
 const ADMIN_PASSKEY = 'Kuldeep Singh';
-const SESSION_KEY = 'studyflow-auth-session';
-const DEVICE_ID_KEY = 'studyflow-device-id';
+const SESSION_KEY = 'sf-session';
+const DEVICE_KEY = 'sf-device';
+const USERS_KEY = 'sf-users';
+
+// --- Pure localStorage helpers (instant, 0ms) ---
+function ls(key: string): any {
+  try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch { return null; }
+}
+function lsSet(key: string, val: any) {
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+}
 
 function getDeviceId(): string {
-  let id = localStorage.getItem(DEVICE_ID_KEY);
-  if (!id) {
-    id = uuidv4();
-    localStorage.setItem(DEVICE_ID_KEY, id);
-  }
+  let id = ls(DEVICE_KEY);
+  if (!id) { id = uuidv4(); lsSet(DEVICE_KEY, id); }
   return id;
 }
 
-function getLocalSession(): AuthSession | null {
-  try {
-    const raw = localStorage.getItem(SESSION_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveLocalSession(session: AuthSession | null) {
-  if (session) {
-    localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-  } else {
-    localStorage.removeItem(SESSION_KEY);
-  }
-}
+function getUsers(): User[] { return ls(USERS_KEY) || []; }
+function saveUsers(users: User[]) { lsSet(USERS_KEY, users); }
 
 type AuthPage = 'login' | 'register';
 
@@ -42,210 +34,181 @@ interface AuthContextType {
   authPage: AuthPage;
   setAuthPage: (p: AuthPage) => void;
   isLoading: boolean;
-
-  register: (name: string, mobile: string, password: string) => Promise<{ success: boolean; error?: string }>;
-  login: (mobile: string, password: string) => Promise<{ success: boolean; error?: string }>;
+  register: (name: string, mobile: string, password: string) => { success: boolean; error?: string };
+  login: (mobile: string, password: string) => { success: boolean; error?: string };
   adminLogin: (passkey: string) => { success: boolean; error?: string };
-  logout: () => Promise<void>;
-
-  getAllUsers: () => Promise<User[]>;
-  getUserData: (userId: string) => Promise<{ tasks: Task[]; sessions: StudySession[]; settings: any }>;
-  deleteUser: (userId: string) => Promise<void>;
+  logout: () => void;
+  getAllUsers: () => User[];
+  getUserData: (userId: string) => { tasks: Task[]; sessions: StudySession[]; settings: any };
+  deleteUser: (userId: string) => void;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [session, setSession] = useState<AuthSession | null>(() => getLocalSession());
+  const [session, setSession] = useState<AuthSession | null>(() => ls(SESSION_KEY));
   const [authPage, setAuthPage] = useState<AuthPage>('login');
-  const [isLoading, setIsLoading] = useState(true);
-
+  const isLoading = false;
+  const deviceId = getDeviceId();
   const isAuthenticated = !!session;
   const isAdmin = session?.isAdmin || false;
-  const deviceId = getDeviceId();
 
+  // Background: pull users from cloud once and merge with local
   useEffect(() => {
-    let mounted = true;
-    async function validateSession() {
-      const saved = getLocalSession();
-      if (saved && !saved.isAdmin) {
-        try {
-          const user = await DB.getUserById(saved.userId);
-          if (mounted && (!user || user.deviceId !== deviceId)) {
-            setSession(null);
-            saveLocalSession(null);
-          }
-        } catch {
-          // Keep session if offline
+    cloudPullUsers().then(cloudUsers => {
+      if (!cloudUsers || cloudUsers.length === 0) return;
+      const local = getUsers();
+      // Merge: add any cloud users not in local
+      const localIds = new Set(local.map(u => u.id));
+      const localMobiles = new Set(local.map(u => u.mobile));
+      let merged = [...local];
+      for (const cu of cloudUsers) {
+        if (!localIds.has(cu.id) && !localMobiles.has(cu.mobile)) {
+          merged.push(cu);
         }
       }
-      if (mounted) setIsLoading(false);
-    }
-    validateSession();
-    return () => { mounted = false; };
-  }, [deviceId]);
+      saveUsers(merged);
+    });
+  }, []);
 
-  const register = useCallback(async (name: string, mobile: string, password: string): Promise<{ success: boolean; error?: string }> => {
+  // REGISTER — instant, no await
+  const register = useCallback((name: string, mobile: string, password: string): { success: boolean; error?: string } => {
     const trimName = name.trim();
     const trimMobile = mobile.trim();
     const trimPass = password.trim();
 
-    if (!trimName) return { success: false, error: 'Name is required' };
-    if (trimName.length < 2) return { success: false, error: 'Name must be at least 2 characters' };
+    if (!trimName || trimName.length < 2) return { success: false, error: 'Name must be at least 2 characters' };
     if (!/^\d{10}$/.test(trimMobile)) return { success: false, error: 'Enter a valid 10-digit mobile number' };
     if (!/^\d{4}$/.test(trimPass)) return { success: false, error: 'Password must be exactly 4 digits' };
 
-    try {
-      // Check if mobile already exists
-      let existing: User | null = null;
-      try {
-        existing = await DB.getUserByMobile(trimMobile);
-      } catch (checkErr: any) {
-        // If checking fails, it's a connection/permission issue
-        return {
-          success: false,
-          error: `Cannot connect to database (${checkErr?.code || checkErr?.message || 'unknown'}). Make sure Firestore is enabled and rules allow access.`
-        };
-      }
-
-      if (existing) {
-        return { success: false, error: 'This mobile number is already registered' };
-      }
-
-      const newUser: User = {
-        id: uuidv4(),
-        name: trimName,
-        mobile: trimMobile,
-        password: trimPass,
-        createdAt: new Date().toISOString(),
-        lastLoginAt: new Date().toISOString(),
-        isLoggedIn: true,
-        deviceId: deviceId,
-      };
-
-      try {
-        await DB.createUser(newUser);
-      } catch (writeErr: any) {
-        return {
-          success: false,
-          error: `Failed to save user (${writeErr?.code || writeErr?.message || 'unknown'}). Check Firestore rules allow writes.`
-        };
-      }
-
-      const newSession: AuthSession = {
-        userId: newUser.id,
-        mobile: newUser.mobile,
-        name: newUser.name,
-        deviceId: deviceId,
-        loggedInAt: new Date().toISOString(),
-        isAdmin: false,
-      };
-      setSession(newSession);
-      saveLocalSession(newSession);
-
-      return { success: true };
-    } catch (err: any) {
-      return { success: false, error: `Unexpected error: ${err?.code || err?.message || String(err)}` };
+    const users = getUsers();
+    if (users.find(u => u.mobile === trimMobile)) {
+      return { success: false, error: 'This mobile number is already registered' };
     }
+
+    const newUser: User = {
+      id: uuidv4(),
+      name: trimName,
+      mobile: trimMobile,
+      password: trimPass,
+      createdAt: new Date().toISOString(),
+      lastLoginAt: new Date().toISOString(),
+      isLoggedIn: true,
+      deviceId,
+    };
+
+    // Save to localStorage (instant)
+    users.push(newUser);
+    saveUsers(users);
+
+    // Cloud backup (fire and forget)
+    cloudSyncUser(newUser);
+
+    // Login immediately
+    const s: AuthSession = {
+      userId: newUser.id, mobile: newUser.mobile, name: newUser.name,
+      deviceId, loggedInAt: new Date().toISOString(), isAdmin: false,
+    };
+    setSession(s);
+    lsSet(SESSION_KEY, s);
+
+    return { success: true };
   }, [deviceId]);
 
-  const login = useCallback(async (mobile: string, password: string): Promise<{ success: boolean; error?: string }> => {
+  // LOGIN — instant, no await
+  const login = useCallback((mobile: string, password: string): { success: boolean; error?: string } => {
     const trimMobile = mobile.trim();
     const trimPass = password.trim();
 
     if (!/^\d{10}$/.test(trimMobile)) return { success: false, error: 'Enter a valid 10-digit mobile number' };
     if (!/^\d{4}$/.test(trimPass)) return { success: false, error: 'Password must be exactly 4 digits' };
 
-    try {
-      let user: User | null = null;
-      try {
-        user = await DB.getUserByMobile(trimMobile);
-      } catch (findErr: any) {
-        return {
-          success: false,
-          error: `Cannot connect to database (${findErr?.code || findErr?.message || 'unknown'}). Check internet and Firestore rules.`
-        };
-      }
+    const users = getUsers();
+    const user = users.find(u => u.mobile === trimMobile);
 
-      if (!user) return { success: false, error: 'No account found with this mobile number' };
-      if (user.password !== trimPass) return { success: false, error: 'Incorrect password' };
+    if (!user) return { success: false, error: 'No account found with this mobile number' };
+    if (user.password !== trimPass) return { success: false, error: 'Incorrect password' };
 
-      if (user.isLoggedIn && user.deviceId !== deviceId) {
-        return { success: false, error: 'Already logged in on another device. Logout from there first.' };
-      }
-
-      try {
-        await DB.updateUser(user.id, {
-          isLoggedIn: true,
-          deviceId: deviceId,
-          lastLoginAt: new Date().toISOString(),
-        });
-      } catch (updateErr: any) {
-        return {
-          success: false,
-          error: `Login matched but failed to update session (${updateErr?.code || updateErr?.message || 'unknown'}).`
-        };
-      }
-
-      const newSession: AuthSession = {
-        userId: user.id,
-        mobile: user.mobile,
-        name: user.name,
-        deviceId: deviceId,
-        loggedInAt: new Date().toISOString(),
-        isAdmin: false,
-      };
-      setSession(newSession);
-      saveLocalSession(newSession);
-
-      return { success: true };
-    } catch (err: any) {
-      return { success: false, error: `Unexpected error: ${err?.code || err?.message || String(err)}` };
+    if (user.isLoggedIn && user.deviceId !== deviceId) {
+      return { success: false, error: 'Already logged in on another device. Logout from there first.' };
     }
-  }, [deviceId]);
 
-  const adminLogin = useCallback((passkey: string): { success: boolean; error?: string } => {
-    if (passkey !== ADMIN_PASSKEY) {
-      return { success: false, error: 'Invalid admin passkey' };
-    }
-    const newSession: AuthSession = {
-      userId: 'admin',
-      mobile: '',
-      name: 'Admin',
-      deviceId: deviceId,
-      loggedInAt: new Date().toISOString(),
-      isAdmin: true,
+    // Update user (instant)
+    user.isLoggedIn = true;
+    user.deviceId = deviceId;
+    user.lastLoginAt = new Date().toISOString();
+    saveUsers(users);
+
+    // Cloud backup (fire and forget)
+    cloudSyncUser(user);
+
+    const s: AuthSession = {
+      userId: user.id, mobile: user.mobile, name: user.name,
+      deviceId, loggedInAt: new Date().toISOString(), isAdmin: false,
     };
-    setSession(newSession);
-    saveLocalSession(newSession);
+    setSession(s);
+    lsSet(SESSION_KEY, s);
+
     return { success: true };
   }, [deviceId]);
 
-  const logout = useCallback(async () => {
+  // ADMIN LOGIN — instant
+  const adminLogin = useCallback((passkey: string): { success: boolean; error?: string } => {
+    if (passkey !== ADMIN_PASSKEY) return { success: false, error: 'Invalid admin passkey' };
+    const s: AuthSession = {
+      userId: 'admin', mobile: '', name: 'Admin',
+      deviceId, loggedInAt: new Date().toISOString(), isAdmin: true,
+    };
+    setSession(s);
+    lsSet(SESSION_KEY, s);
+    return { success: true };
+  }, [deviceId]);
+
+  // LOGOUT — instant
+  const logout = useCallback(() => {
     if (session && !session.isAdmin) {
-      try { await DB.updateUser(session.userId, { isLoggedIn: false }); } catch {}
+      const users = getUsers();
+      const user = users.find(u => u.id === session.userId);
+      if (user) {
+        user.isLoggedIn = false;
+        saveUsers(users);
+        cloudSyncUser(user); // background
+      }
     }
     setSession(null);
-    saveLocalSession(null);
+    localStorage.removeItem(SESSION_KEY);
   }, [session]);
 
-  const getAllUsers = useCallback(async (): Promise<User[]> => {
-    return await DB.getAllUsers();
+  // ADMIN: get all users — instant from localStorage
+  const getAllUsers = useCallback((): User[] => {
+    return getUsers();
   }, []);
 
-  const getUserData = useCallback(async (userId: string) => {
-    return await DB.getUserDataForAdmin(userId);
+  // ADMIN: get user data — instant from localStorage
+  const getUserData = useCallback((userId: string) => {
+    const tasks: Task[] = ls(`sf-tasks-${userId}`) || [];
+    const sessions: StudySession[] = ls(`sf-sessions-${userId}`) || [];
+    const settings = ls(`sf-settings-${userId}`) || {};
+    return { tasks, sessions, settings };
   }, []);
 
-  const deleteUser = useCallback(async (userId: string) => {
-    await DB.deleteUserCompletely(userId);
+  // ADMIN: delete user — instant
+  const deleteUser = useCallback((userId: string) => {
+    const users = getUsers().filter(u => u.id !== userId);
+    saveUsers(users);
+    localStorage.removeItem(`sf-tasks-${userId}`);
+    localStorage.removeItem(`sf-sessions-${userId}`);
+    localStorage.removeItem(`sf-settings-${userId}`);
+    localStorage.removeItem(`sf-view-${userId}`);
+    cloudDeleteUser(userId); // background
   }, []);
 
   const value = useMemo(() => ({
     session, isAuthenticated, isAdmin, authPage, setAuthPage, isLoading,
     register, login, adminLogin, logout,
     getAllUsers, getUserData, deleteUser,
-  }), [session, isAuthenticated, isAdmin, authPage, setAuthPage, isLoading, register, login, adminLogin, logout, getAllUsers, getUserData, deleteUser]);
+  }), [session, isAuthenticated, isAdmin, authPage, setAuthPage, isLoading,
+    register, login, adminLogin, logout, getAllUsers, getUserData, deleteUser]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

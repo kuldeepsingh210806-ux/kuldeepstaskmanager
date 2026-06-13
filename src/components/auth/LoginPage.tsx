@@ -24,7 +24,6 @@ export default function LoginPage() {
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
   const [showAdminModal, setShowAdminModal] = useState(false);
   const [adminKey, setAdminKey] = useState('');
   const [adminError, setAdminError] = useState('');
@@ -56,20 +55,12 @@ export default function LoginPage() {
     mobileRef.current?.focus();
   }, []);
 
-  const handleLogin = async (e: React.FormEvent) => {
+  const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    setIsLoading(true);
-
-    try {
-      const result = await login(mobile, password);
-      if (!result.success) {
-        setError(result.error || 'Login failed');
-      }
-    } catch {
-      setError('Connection error. Please try again.');
-    } finally {
-      setIsLoading(false);
+    const result = login(mobile, password);
+    if (!result.success) {
+      setError(result.error || 'Login failed');
     }
   };
 
@@ -210,22 +201,16 @@ export default function LoginPage() {
             {/* Login Button */}
             <button
               type="submit"
-              disabled={isLoading || mobile.length !== 10 || password.length !== 4 || dbStatus === 'error'}
+              disabled={mobile.length !== 10 || password.length !== 4}
               className={cn(
                 'w-full flex items-center justify-center gap-2 py-3.5 rounded-xl text-sm font-semibold transition-all duration-300',
-                mobile.length === 10 && password.length === 4 && dbStatus !== 'error'
+                mobile.length === 10 && password.length === 4
                   ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-lg shadow-violet-500/25 hover:shadow-violet-500/40 hover:from-violet-500 hover:to-indigo-500'
                   : 'bg-slate-800/60 text-slate-500 cursor-not-allowed'
               )}
             >
-              {isLoading ? (
-                <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-              ) : (
-                <>
-                  <LogIn size={16} />
-                  Sign In
-                </>
-              )}
+              <LogIn size={16} />
+              Sign In
             </button>
           </form>
 

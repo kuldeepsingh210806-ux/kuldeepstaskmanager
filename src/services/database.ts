@@ -1,87 +1,66 @@
 import { db } from '../firebase';
-import {
-  doc,
-  getDoc,
-  setDoc,
-  deleteDoc,
-  collection,
-  getDocs,
-} from 'firebase/firestore';
-import type { User, Task, StudySession, AppSettings, ViewType } from '../types';
+import { doc, getDoc, setDoc, deleteDoc, collection, getDocs } from 'firebase/firestore';
+import type { User } from '../types';
 
-// ============================================================
-// USERS — stored as individual docs in /users/{id}
-// ============================================================
+// =============================================
+// All functions are fire-and-forget.
+// They NEVER block the UI. Errors are silent.
+// localStorage is the source of truth.
+// Firebase is just a cloud backup mirror.
+// =============================================
 
-export async function getAllUsers(): Promise<User[]> {
-  const snap = await getDocs(collection(db, 'users'));
-  return snap.docs.map(d => d.data() as User);
-}
+// --- USERS (cloud mirror) ---
 
-export async function getUserByMobile(mobile: string): Promise<User | null> {
-  const all = await getAllUsers();
-  return all.find(u => u.mobile === mobile) || null;
-}
-
-export async function getUserById(id: string): Promise<User | null> {
-  const d = await getDoc(doc(db, 'users', id));
-  if (!d.exists()) return null;
-  return d.data() as User;
-}
-
-export async function createUser(user: User): Promise<void> {
-  await setDoc(doc(db, 'users', user.id), {
-    id: user.id, name: user.name, mobile: user.mobile, password: user.password,
-    createdAt: user.createdAt, lastLoginAt: user.lastLoginAt,
-    isLoggedIn: user.isLoggedIn, deviceId: user.deviceId,
+export function cloudSyncAllUsers(users: User[]) {
+  // Sync entire users list to cloud in background
+  Promise.resolve().then(async () => {
+    try {
+      for (const u of users) {
+        await setDoc(doc(db, 'users', u.id), JSON.parse(JSON.stringify(u)));
+      }
+    } catch (e) { console.warn('[cloud] sync users failed:', e); }
   });
 }
 
-export async function updateUser(id: string, updates: Partial<User>): Promise<void> {
-  await setDoc(doc(db, 'users', id), updates, { merge: true });
+export function cloudSyncUser(user: User) {
+  setDoc(doc(db, 'users', user.id), JSON.parse(JSON.stringify(user)))
+    .catch(e => console.warn('[cloud] sync user failed:', e));
 }
 
-export async function deleteUserCompletely(id: string): Promise<void> {
-  try { await deleteDoc(doc(db, 'appData', id)); } catch {}
-  await deleteDoc(doc(db, 'users', id));
+export function cloudDeleteUser(id: string) {
+  Promise.resolve().then(async () => {
+    try {
+      await deleteDoc(doc(db, 'appData', id));
+      await deleteDoc(doc(db, 'users', id));
+    } catch (e) { console.warn('[cloud] delete user failed:', e); }
+  });
 }
 
-// ============================================================
-// APP DATA — ALL user data in ONE document: /appData/{userId}
-// { tasks: [...], sessions: [...], settings: {...}, currentView: "..." }
-// 1 read to load everything, 1 write to save everything.
-// ============================================================
+// --- APP DATA (single doc per user) ---
 
-export interface UserAppData {
-  tasks: Task[];
-  sessions: StudySession[];
-  settings: AppSettings | null;
-  currentView: ViewType;
+export function cloudSyncAppData(userId: string, data: object) {
+  setDoc(doc(db, 'appData', userId), JSON.parse(JSON.stringify(data)))
+    .catch(e => console.warn('[cloud] sync appData failed:', e));
 }
 
-export async function loadUserAppData(userId: string): Promise<UserAppData | null> {
+// --- PULL from cloud (used once on first-ever load) ---
+
+export async function cloudPullUsers(): Promise<User[] | null> {
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    if (snap.empty) return null;
+    return snap.docs.map(d => d.data() as User);
+  } catch { return null; }
+}
+
+export async function cloudPullAppData(userId: string): Promise<any | null> {
   try {
     const d = await getDoc(doc(db, 'appData', userId));
-    if (!d.exists()) return null;
-    const raw = d.data();
-    return {
-      tasks: raw.tasks || [],
-      sessions: raw.sessions || [],
-      settings: raw.settings || null,
-      currentView: raw.currentView || 'dashboard',
-    };
-  } catch {
-    return null;
-  }
+    return d.exists() ? d.data() : null;
+  } catch { return null; }
 }
 
-export async function saveUserAppData(userId: string, data: UserAppData): Promise<void> {
-  await setDoc(doc(db, 'appData', userId), JSON.parse(JSON.stringify(data)));
-}
-
-// ============================================================
-// CONNECTION TEST
-// ============================================================
+// --- CONNECTION TEST ---
 
 export async function testFirestoreConnection(): Promise<{ ok: boolean; error?: string }> {
   try {
@@ -90,17 +69,4 @@ export async function testFirestoreConnection(): Promise<{ ok: boolean; error?: 
   } catch (err: any) {
     return { ok: false, error: err?.code || err?.message || 'Unknown error' };
   }
-}
-
-// ============================================================
-// ADMIN helpers
-// ============================================================
-
-export async function getUserDataForAdmin(userId: string) {
-  const data = await loadUserAppData(userId);
-  return {
-    tasks: data?.tasks || [],
-    sessions: data?.sessions || [],
-    settings: data?.settings || null,
-  };
 }

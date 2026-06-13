@@ -25,7 +25,6 @@ export default function RegisterPage() {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
   const [dbStatus, setDbStatus] = useState<'checking' | 'connected' | 'error'>('checking');
   const nameRef = useRef<HTMLInputElement>(null);
 
@@ -41,7 +40,7 @@ export default function RegisterPage() {
     nameRef.current?.focus();
   }, []);
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
@@ -50,16 +49,9 @@ export default function RegisterPage() {
       return;
     }
 
-    setIsLoading(true);
-    try {
-      const result = await register(name, mobile, password);
-      if (!result.success) {
-        setError(result.error || 'Registration failed');
-      }
-    } catch (err: any) {
-      setError(`Connection error: ${err?.message || 'Please try again.'}`);
-    } finally {
-      setIsLoading(false);
+    const result = register(name, mobile, password);
+    if (!result.success) {
+      setError(result.error || 'Registration failed');
     }
   };
 
@@ -256,22 +248,16 @@ export default function RegisterPage() {
             {/* Register Button */}
             <button
               type="submit"
-              disabled={isLoading || !isValid || dbStatus === 'error'}
+              disabled={!isValid}
               className={cn(
                 'w-full flex items-center justify-center gap-2 py-3.5 rounded-xl text-sm font-semibold transition-all duration-300',
-                isValid && dbStatus !== 'error'
+                isValid
                   ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-lg shadow-emerald-500/25 hover:shadow-emerald-500/40 hover:from-emerald-500 hover:to-teal-500'
                   : 'bg-slate-800/60 text-slate-500 cursor-not-allowed'
               )}
             >
-              {isLoading ? (
-                <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-              ) : (
-                <>
-                  <UserPlus size={16} />
-                  Create Account
-                </>
-              )}
+              <UserPlus size={16} />
+              Create Account
             </button>
           </form>
 

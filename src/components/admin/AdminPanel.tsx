@@ -25,14 +25,12 @@ import {
   Target,
   Flame,
   RefreshCw,
-  Loader2,
 } from 'lucide-react';
 import { format, parseISO, subDays, eachDayOfInterval } from 'date-fns';
 
 export default function AdminPanel() {
   const { logout, getAllUsers, getUserData, deleteUser } = useAuth();
   const [users, setUsers] = useState<User[]>([]);
-  const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedUser, setExpandedUser] = useState<string | null>(null);
   const [expandedPerf, setExpandedPerf] = useState<UserPerfData | null>(null);
@@ -40,16 +38,10 @@ export default function AdminPanel() {
   const [selectedPerf, setSelectedPerf] = useState<UserPerfData | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<'name' | 'recent' | 'created'>('recent');
+  const loading = false;
 
-  const loadUsers = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await getAllUsers();
-      setUsers(data);
-    } catch (err) {
-      console.error('Failed to load users:', err);
-    }
-    setLoading(false);
+  const loadUsers = useCallback(() => {
+    setUsers(getAllUsers());
   }, [getAllUsers]);
 
   useEffect(() => { loadUsers(); }, [loadUsers]);
@@ -118,42 +110,32 @@ export default function AdminPanel() {
     };
   };
 
-  const handleExpandUser = async (userId: string) => {
+  const handleExpandUser = (userId: string) => {
     if (expandedUser === userId) {
       setExpandedUser(null);
       setExpandedPerf(null);
       return;
     }
     setExpandedUser(userId);
-    setExpandedPerf(null);
-    try {
-      const data = await getUserData(userId);
-      const perf = computePerformance(data.tasks as Task[], data.sessions as StudySession[]);
-      setExpandedPerf(perf);
-    } catch (err) {
-      console.error('Failed to load user data:', err);
-    }
+    const data = getUserData(userId);
+    const perf = computePerformance(data.tasks as Task[], data.sessions as StudySession[]);
+    setExpandedPerf(perf);
   };
 
-  const handleViewDetail = async (userId: string) => {
+  const handleViewDetail = (userId: string) => {
     setSelectedUserDetail(userId);
-    setSelectedPerf(null);
-    try {
-      const data = await getUserData(userId);
-      const perf = computePerformance(data.tasks as Task[], data.sessions as StudySession[]);
-      setSelectedPerf(perf);
-    } catch (err) {
-      console.error('Failed to load user detail:', err);
-    }
+    const data = getUserData(userId);
+    const perf = computePerformance(data.tasks as Task[], data.sessions as StudySession[]);
+    setSelectedPerf(perf);
   };
 
-  const handleDeleteUser = async (userId: string) => {
+  const handleDeleteUser = (userId: string) => {
     try {
-      await deleteUser(userId);
+      deleteUser(userId);
       setShowDeleteConfirm(null);
       setExpandedUser(null);
       setSelectedUserDetail(null);
-      await loadUsers();
+      loadUsers();
     } catch (err) {
       console.error('Failed to delete user:', err);
     }
@@ -229,13 +211,8 @@ export default function AdminPanel() {
           </select>
         </div>
 
-        {/* Loading state */}
-        {loading ? (
-          <div className="text-center py-16 bg-slate-800/30 rounded-2xl border border-white/5">
-            <Loader2 className="mx-auto mb-3 text-amber-400 animate-spin" size={32} />
-            <p className="text-slate-400 text-sm">Loading users from database...</p>
-          </div>
-        ) : filteredUsers.length === 0 ? (
+        {/* Users list */}
+        {filteredUsers.length === 0 ? (
           <div className="text-center py-16 bg-slate-800/30 rounded-2xl border border-white/5">
             <Users className="mx-auto mb-3 text-slate-600" size={40} />
             <p className="text-slate-400 font-medium">
@@ -307,14 +284,8 @@ export default function AdminPanel() {
                   </div>
 
                   {/* Expanded Quick View */}
-                  {isExpanded && (
+                  {isExpanded && expandedPerf && (
                     <div className="px-4 pb-4 border-t border-white/5 pt-3 animate-fade-in">
-                      {!expandedPerf ? (
-                        <div className="flex items-center justify-center py-6">
-                          <Loader2 size={20} className="text-amber-400 animate-spin" />
-                          <span className="text-xs text-slate-400 ml-2">Loading performance...</span>
-                        </div>
-                      ) : (
                         <>
                           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
                             <MiniStat label="Study Time" value={`${Math.round(expandedPerf.totalStudyMin)}m`} icon={<Clock size={13} />} />
@@ -355,7 +326,6 @@ export default function AdminPanel() {
                             })}
                           </div>
                         </>
-                      )}
                     </div>
                   )}
                 </div>
@@ -521,8 +491,7 @@ function UserDetailModal({ user, perf, onClose }: { user: User; perf: UserPerfDa
         <div className="p-6 max-h-[60vh] overflow-y-auto">
           {!perf ? (
             <div className="flex items-center justify-center py-16">
-              <Loader2 size={24} className="text-amber-400 animate-spin" />
-              <span className="text-sm text-slate-400 ml-3">Loading user data...</span>
+              <span className="text-sm text-slate-400">No data available</span>
             </div>
           ) : tab === 'overview' ? (
             <div className="space-y-6">
