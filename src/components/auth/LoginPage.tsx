@@ -35,13 +35,13 @@ export default function LoginPage() {
   useEffect(() => {
     async function checkDb() {
       const result = await testFirestoreConnection();
-      if (result.ok) {
+      if (result.ok && result.writeOk) {
         setDbStatus('connected');
       } else {
         setDbStatus('error');
         const code = result.error || '';
         if (code.includes('permission-denied')) {
-          setDbError('Firestore rules are blocking access. Update rules to allow read/write.');
+          setDbError('Firestore Security Rules are blocking writes. Update rules to allow read/write.');
         } else if (code.includes('unavailable') || code.includes('Failed to fetch')) {
           setDbError('Cannot reach Firebase. Check your internet connection.');
         } else if (code.includes('not-found') || code.includes('NOT_FOUND')) {
@@ -355,7 +355,7 @@ function FirestoreFixGuide({ dbError }: { dbError: string }) {
         <p className="text-[11px] text-white font-semibold">🔧 Fix in 3 steps:</p>
         <div className="flex items-start gap-2">
           <span className="text-[10px] bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded font-bold flex-shrink-0">1</span>
-          <p className="text-[11px] text-slate-300">Open <a href="https://console.firebase.google.com/project/kuldeep-a1832/firestore/databases/-default-/rules" target="_blank" rel="noopener" className="text-amber-400 underline underline-offset-2">Firebase Console → Firestore → Rules</a></p>
+          <p className="text-[11px] text-slate-300">Open <a href={`https://console.firebase.google.com/project/${import.meta.env.VITE_FIREBASE_PROJECT_ID}/firestore/databases/-default-/rules`} target="_blank" rel="noopener" className="text-amber-400 underline underline-offset-2">Firebase Console → Firestore → Rules</a></p>
         </div>
         <div className="flex items-start gap-2">
           <span className="text-[10px] bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded font-bold flex-shrink-0">2</span>

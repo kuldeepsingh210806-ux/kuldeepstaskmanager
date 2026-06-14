@@ -93,8 +93,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (timerRef.current) clearTimeout(timerRef.current);
     setSyncStatus('syncing');
     timerRef.current = setTimeout(() => {
-      const s = stateRef.current;
-      cloudSyncAppData(uid, s);
+      const { tasks, sessions, settings } = stateRef.current;
+      cloudSyncAppData(uid, { tasks, sessions, settings });
       setTimeout(() => setSyncStatus('synced'), 800);
     }, 3000);
   }, [uid]);
