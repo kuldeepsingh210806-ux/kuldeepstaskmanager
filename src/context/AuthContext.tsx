@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import type { User, AuthSession, Task, StudySession } from '../types';
 import { cloudSyncUser, cloudDeleteUser, cloudPullUsers } from '../services/database';
 
-const ADMIN_PASSKEY = 'Kuldeep Singh';
+const ADMIN_PASSKEY = import.meta.env.VITE_ADMIN_PASSKEY || 'Kuldeep Singh';
 const SESSION_KEY = 'sf-session';
 const DEVICE_KEY = 'sf-device';
 const USERS_KEY = 'sf-users';
