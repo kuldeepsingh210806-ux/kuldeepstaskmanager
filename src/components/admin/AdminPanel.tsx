@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
+import { subscribeToUsers, subscribeToAppData } from '../../services/database';
 import { cn } from '../../utils/cn';
 import type { User, Task, StudySession } from '../../types';
 import {
@@ -21,172 +22,219 @@ import {
   GraduationCap,
   X,
   UserCircle,
-  Activity,
   Target,
   Flame,
   RefreshCw,
   Loader2,
-  Database,
-  TrendingUp,
+  Wifi,
+  WifiOff,
 } from 'lucide-react';
 import { format, parseISO, subDays, eachDayOfInterval } from 'date-fns';
 
+// ─── Performance computation (pure) ──────────────────────────────────────────
+function computePerformance(tasks: Task[], sessions: StudySession[]): UserPerfData {
+  const workSessions = sessions.filter(s => s.type === 'work' && s.completed);
+  const totalStudyMin = workSessions.reduce((a, s) => a + s.duration / 60, 0);
+  const totalTasks = tasks.length;
+  const completedTasks = tasks.filter(t => t.status === 'completed').length;
+  const completionRate = totalTasks > 0 ? (completedTasks / totalTasks) * 100 : 0;
+  const avgSessionMin = workSessions.length > 0 ? totalStudyMin / workSessions.length : 0;
+
+  const dates = new Set(workSessions.map(s => new Date(s.startTime).toDateString()));
+  let streak = 0;
+  const today = new Date();
+  for (let i = 0; i < 365; i++) {
+    const d = new Date(today.getTime() - i * 86400000);
+    if (dates.has(d.toDateString())) streak++;
+    else if (i > 0) break;
+  }
+
+  const last7 = eachDayOfInterval({ start: subDays(today, 6), end: today }).map(day => {
+    const dayStr = format(day, 'yyyy-MM-dd');
+    const mins = workSessions
+      .filter(s => format(parseISO(s.startTime), 'yyyy-MM-dd') === dayStr)
+      .reduce((a, s) => a + s.duration / 60, 0);
+    return { day: format(day, 'EEE'), mins: Math.round(mins) };
+  });
+
+  const catMap = new Map<string, number>();
+  workSessions.forEach(s => { catMap.set(s.category, (catMap.get(s.category) || 0) + s.duration / 60); });
+  const categories = Array.from(catMap.entries())
+    .map(([name, mins]) => ({ name, mins: Math.round(mins) }))
+    .sort((a, b) => b.mins - a.mins);
+
+  const priorities = {
+    urgent: tasks.filter(t => t.priority === 'urgent').length,
+    high:   tasks.filter(t => t.priority === 'high').length,
+    medium: tasks.filter(t => t.priority === 'medium').length,
+    low:    tasks.filter(t => t.priority === 'low').length,
+  };
+
+  return {
+    totalStudyMin, totalTasks, completedTasks, completionRate,
+    avgSessionMin, streak, totalSessions: workSessions.length,
+    last7, categories, priorities, tasks, sessions: workSessions,
+  };
+}
+
+// ─── Main component ───────────────────────────────────────────────────────────
 export default function AdminPanel() {
-  const { logout, getAllUsers, deleteUser, refreshUsersFromCloud, getUserDataFromCloud } = useAuth();
+  const { logout, getAllUsers, deleteUser } = useAuth();
+
+  // Users list state
   const [users, setUsers] = useState<User[]>([]);
+  const [isConnecting, setIsConnecting] = useState(true);
+  const [isLive, setIsLive] = useState(false);
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+
+  // UI state
   const [searchQuery, setSearchQuery] = useState('');
-  const [expandedUser, setExpandedUser] = useState<string | null>(null);
-  const [expandedPerf, setExpandedPerf] = useState<UserPerfData | null>(null);
-  const [selectedUserDetail, setSelectedUserDetail] = useState<string | null>(null);
-  const [selectedPerf, setSelectedPerf] = useState<UserPerfData | null>(null);
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<'name' | 'recent' | 'created'>('recent');
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [loadingUserId, setLoadingUserId] = useState<string | null>(null);
-  const [lastSynced, setLastSynced] = useState<Date | null>(null);
-  const [cloudError, setCloudError] = useState<string | null>(null);
+  const [expandedUser, setExpandedUser] = useState<string | null>(null);
+  const [selectedUserDetail, setSelectedUserDetail] = useState<string | null>(null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
 
-  // ─── Load users from Firestore on mount ──────────────────────────────────
-  const loadUsers = useCallback(async () => {
-    setIsRefreshing(true);
-    setCloudError(null);
-    try {
-      const freshUsers = await refreshUsersFromCloud();
-      setUsers(freshUsers);
-      setLastSynced(new Date());
-    } catch (err: any) {
-      console.error('[Admin] Failed to refresh users from cloud:', err);
-      setCloudError('Could not reach cloud — showing local data only.');
-      setUsers(getAllUsers());
-    } finally {
-      setIsRefreshing(false);
+  // Per-student data state
+  const [expandedPerf, setExpandedPerf] = useState<UserPerfData | null>(null);
+  const [expandedLoading, setExpandedLoading] = useState(false);
+  const [selectedPerf, setSelectedPerf] = useState<UserPerfData | null>(null);
+  const [selectedLoading, setSelectedLoading] = useState(false);
+
+  // Force re-subscribe on manual refresh
+  const [subKey, setSubKey] = useState(0);
+
+  // ── Real-time: users collection ───────────────────────────────────────────
+  useEffect(() => {
+    setIsConnecting(true);
+    setIsLive(false);
+    setLiveError(null);
+
+    const unsub = subscribeToUsers(
+      (cloudUsers) => {
+        // Merge cloud users with any local-only users (edge: not yet synced)
+        const local = getAllUsers();
+        const cloudIds = new Set(cloudUsers.map(u => u.id));
+        const localOnly = local.filter(u => !cloudIds.has(u.id));
+        setUsers([...cloudUsers, ...localOnly]);
+        setIsConnecting(false);
+        setIsLive(true);
+        setLiveError(null);
+        setLastUpdated(new Date());
+      },
+      (err) => {
+        setIsConnecting(false);
+        setIsLive(false);
+        setLiveError('Lost connection — showing local data.');
+        setUsers(getAllUsers());
+        console.error('[Admin] Users subscription error:', err);
+      }
+    );
+
+    return () => unsub();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subKey]);
+
+  // ── Real-time: expanded row student data ──────────────────────────────────
+  useEffect(() => {
+    if (!expandedUser) {
+      setExpandedPerf(null);
+      setExpandedLoading(false);
+      return;
     }
-  }, [refreshUsersFromCloud, getAllUsers]);
 
-  useEffect(() => { loadUsers(); }, [loadUsers]);
+    setExpandedPerf(null);
+    setExpandedLoading(true);
 
-  // ─── Sorting / filtering ──────────────────────────────────────────────────
-  const getFilteredUsers = () => {
+    const unsub = subscribeToAppData(
+      expandedUser,
+      (data) => {
+        const tasks: Task[] = data?.tasks ?? [];
+        const sessions: StudySession[] = data?.sessions ?? [];
+        setExpandedPerf(computePerformance(tasks, sessions));
+        setExpandedLoading(false);
+      },
+      () => {
+        setExpandedPerf(computePerformance([], []));
+        setExpandedLoading(false);
+      }
+    );
+
+    return () => unsub();
+  }, [expandedUser]);
+
+  // ── Real-time: detail modal student data ──────────────────────────────────
+  useEffect(() => {
+    if (!selectedUserDetail) {
+      setSelectedPerf(null);
+      setSelectedLoading(false);
+      return;
+    }
+
+    setSelectedPerf(null);
+    setSelectedLoading(true);
+
+    const unsub = subscribeToAppData(
+      selectedUserDetail,
+      (data) => {
+        const tasks: Task[] = data?.tasks ?? [];
+        const sessions: StudySession[] = data?.sessions ?? [];
+        setSelectedPerf(computePerformance(tasks, sessions));
+        setSelectedLoading(false);
+      },
+      () => {
+        setSelectedPerf(computePerformance([], []));
+        setSelectedLoading(false);
+      }
+    );
+
+    return () => unsub();
+  }, [selectedUserDetail]);
+
+  // ── Actions ───────────────────────────────────────────────────────────────
+  const handleExpandUser = useCallback((userId: string) => {
+    setExpandedUser(prev => (prev === userId ? null : userId));
+  }, []);
+
+  const handleViewDetail = useCallback((userId: string) => {
+    setSelectedUserDetail(userId);
+  }, []);
+
+  const handleDeleteUser = useCallback((userId: string) => {
+    deleteUser(userId);
+    setShowDeleteConfirm(null);
+    setExpandedUser(null);
+    setSelectedUserDetail(null);
+    setUsers(prev => prev.filter(u => u.id !== userId));
+  }, [deleteUser]);
+
+  const handleRefresh = useCallback(() => {
+    setSubKey(k => k + 1);
+  }, []);
+
+  // ── Derived values ────────────────────────────────────────────────────────
+  const filteredUsers = (() => {
     let result = [...users];
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
-      result = result.filter(u =>
-        u.name.toLowerCase().includes(q) || u.mobile.includes(q)
-      );
+      result = result.filter(u => u.name.toLowerCase().includes(q) || u.mobile.includes(q));
     }
     result.sort((a, b) => {
-      if (sortBy === 'name') return a.name.localeCompare(b.name);
+      if (sortBy === 'name')   return a.name.localeCompare(b.name);
       if (sortBy === 'recent') return new Date(b.lastLoginAt).getTime() - new Date(a.lastLoginAt).getTime();
       return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
     });
     return result;
-  };
-
-  const filteredUsers = getFilteredUsers();
-
-  // ─── Performance computation (pure) ──────────────────────────────────────
-  const computePerformance = (tasks: Task[], sessions: StudySession[]): UserPerfData => {
-    const workSessions = sessions.filter(s => s.type === 'work' && s.completed);
-    const totalStudyMin = workSessions.reduce((a, s) => a + s.duration / 60, 0);
-    const totalTasks = tasks.length;
-    const completedTasks = tasks.filter(t => t.status === 'completed').length;
-    const completionRate = totalTasks > 0 ? (completedTasks / totalTasks) * 100 : 0;
-    const avgSessionMin = workSessions.length > 0 ? totalStudyMin / workSessions.length : 0;
-
-    const dates = new Set(workSessions.map(s => new Date(s.startTime).toDateString()));
-    let streak = 0;
-    const today = new Date();
-    for (let i = 0; i < 365; i++) {
-      const d = new Date(today.getTime() - i * 86400000);
-      if (dates.has(d.toDateString())) streak++;
-      else if (i > 0) break;
-    }
-
-    const last7 = eachDayOfInterval({ start: subDays(today, 6), end: today }).map(day => {
-      const dayStr = format(day, 'yyyy-MM-dd');
-      const mins = workSessions
-        .filter(s => format(parseISO(s.startTime), 'yyyy-MM-dd') === dayStr)
-        .reduce((a, s) => a + s.duration / 60, 0);
-      return { day: format(day, 'EEE'), mins: Math.round(mins) };
-    });
-
-    const catMap = new Map<string, number>();
-    workSessions.forEach(s => { catMap.set(s.category, (catMap.get(s.category) || 0) + s.duration / 60); });
-    const categories = Array.from(catMap.entries())
-      .map(([name, mins]) => ({ name, mins: Math.round(mins) }))
-      .sort((a, b) => b.mins - a.mins);
-
-    const priorities = {
-      urgent: tasks.filter(t => t.priority === 'urgent').length,
-      high:   tasks.filter(t => t.priority === 'high').length,
-      medium: tasks.filter(t => t.priority === 'medium').length,
-      low:    tasks.filter(t => t.priority === 'low').length,
-    };
-
-    return {
-      totalStudyMin, totalTasks, completedTasks, completionRate,
-      avgSessionMin, streak, totalSessions: workSessions.length,
-      last7, categories, priorities, tasks, sessions: workSessions,
-    };
-  };
-
-  // ─── Expand row: fetch from Firestore ────────────────────────────────────
-  const handleExpandUser = async (userId: string) => {
-    if (expandedUser === userId) {
-      setExpandedUser(null);
-      setExpandedPerf(null);
-      return;
-    }
-    setExpandedUser(userId);
-    setExpandedPerf(null);
-    setLoadingUserId(userId);
-    try {
-      const data = await getUserDataFromCloud(userId);
-      const perf = computePerformance(data.tasks, data.sessions);
-      setExpandedPerf(perf);
-    } catch (err) {
-      console.error('[Admin] Failed to load user data from cloud:', err);
-      setExpandedPerf(computePerformance([], []));
-    } finally {
-      setLoadingUserId(null);
-    }
-  };
-
-  // ─── Detail modal: fetch from Firestore ──────────────────────────────────
-  const handleViewDetail = async (userId: string) => {
-    setSelectedUserDetail(userId);
-    setSelectedPerf(null);
-    setLoadingUserId(userId);
-    try {
-      const data = await getUserDataFromCloud(userId);
-      const perf = computePerformance(data.tasks, data.sessions);
-      setSelectedPerf(perf);
-    } catch (err) {
-      console.error('[Admin] Failed to load user detail from cloud:', err);
-      setSelectedPerf(computePerformance([], []));
-    } finally {
-      setLoadingUserId(null);
-    }
-  };
-
-  const handleDeleteUser = (userId: string) => {
-    try {
-      deleteUser(userId);
-      setShowDeleteConfirm(null);
-      setExpandedUser(null);
-      setSelectedUserDetail(null);
-      setUsers(prev => prev.filter(u => u.id !== userId));
-    } catch (err) {
-      console.error('Failed to delete user:', err);
-    }
-  };
+  })();
 
   const activeNow = users.filter(u => u.isLoggedIn).length;
-  const selectedUser = selectedUserDetail ? users.find(u => u.id === selectedUserDetail) : null;
+  const selectedUser = selectedUserDetail ? users.find(u => u.id === selectedUserDetail) ?? null : null;
 
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-[#0B0F19]">
-      {/* Top Bar */}
+
+      {/* ── Top Bar ─────────────────────────────────────────────────────── */}
       <div className="sticky top-0 z-30 bg-slate-900/95 backdrop-blur-xl border-b border-white/5">
         <div className="max-w-7xl mx-auto px-4 md:px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -194,23 +242,44 @@ export default function AdminPanel() {
               <Shield size={20} className="text-white" />
             </div>
             <div>
-              <h1 className="text-lg font-bold text-white">Admin Dashboard</h1>
+              <div className="flex items-center gap-2">
+                <h1 className="text-lg font-bold text-white">Admin Dashboard</h1>
+                {isLive && (
+                  <span className="flex items-center gap-1.5 text-[10px] bg-emerald-500/15 text-emerald-400 px-2 py-0.5 rounded-full border border-emerald-500/20">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    LIVE
+                  </span>
+                )}
+                {isConnecting && (
+                  <span className="flex items-center gap-1.5 text-[10px] bg-amber-500/15 text-amber-400 px-2 py-0.5 rounded-full border border-amber-500/20">
+                    <Loader2 size={9} className="animate-spin" />
+                    Connecting…
+                  </span>
+                )}
+                {liveError && (
+                  <span className="flex items-center gap-1 text-[10px] text-red-400">
+                    <WifiOff size={10} />
+                    Offline
+                  </span>
+                )}
+              </div>
               <p className="text-[11px] text-slate-400">
-                {lastSynced
-                  ? `Last synced ${format(lastSynced, 'h:mm:ss a')} · all data from Firestore`
-                  : 'Syncing with Firestore...'}
+                {lastUpdated
+                  ? `Updated ${format(lastUpdated, 'h:mm:ss a')} · real-time Firestore sync`
+                  : 'Connecting to Firestore…'}
               </p>
             </div>
           </div>
+
           <div className="flex items-center gap-2">
             <button
-              onClick={loadUsers}
-              disabled={isRefreshing}
+              onClick={handleRefresh}
+              disabled={isConnecting}
+              title="Reconnect live listener"
               className="flex items-center gap-2 px-3 py-2 bg-slate-800/50 hover:bg-slate-700/50 border border-white/10 rounded-xl text-sm text-slate-300 hover:text-white transition-all disabled:opacity-60"
-              title="Refresh from Firestore"
             >
-              <RefreshCw size={14} className={isRefreshing ? 'animate-spin text-amber-400' : ''} />
-              {isRefreshing ? 'Syncing…' : 'Refresh'}
+              <RefreshCw size={14} className={isConnecting ? 'animate-spin text-amber-400' : ''} />
+              <span className="hidden sm:inline">{isConnecting ? 'Connecting…' : 'Reconnect'}</span>
             </button>
             <button
               onClick={logout}
@@ -225,29 +294,29 @@ export default function AdminPanel() {
 
       <div className="max-w-7xl mx-auto px-4 md:px-6 py-6 space-y-6">
 
-        {/* Cloud error banner */}
-        {cloudError && (
+        {/* ── Error banner ────────────────────────────────────────────────── */}
+        {liveError && (
           <div className="flex items-center gap-3 p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-sm text-amber-300">
             <AlertTriangle size={16} className="flex-shrink-0" />
-            {cloudError}
+            {liveError} Click Reconnect to retry.
           </div>
         )}
 
-        {/* Overview Stats */}
+        {/* ── Stats ───────────────────────────────────────────────────────── */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <AdminStat icon={<Users size={18} />}    label="Total Students" value={users.length}  color="from-violet-500 to-indigo-500" />
-          <AdminStat icon={<Activity size={18} />} label="Active Now"     value={activeNow}     color="from-emerald-500 to-teal-500" />
-          <AdminStat icon={<Database size={18} />} label="Cloud Synced"   value={users.length}  color="from-cyan-500 to-blue-500" />
-          <AdminStat icon={<TrendingUp size={18} />} label="Users Online" value={activeNow}     color="from-pink-500 to-rose-500" />
+          <AdminStat icon={<Users size={18} />}      label="Total Students" value={users.length}  color="from-violet-500 to-indigo-500" />
+          <AdminStat icon={<Wifi size={18} />}       label="Active Now"     value={activeNow}     color="from-emerald-500 to-teal-500" />
+          <AdminStat icon={<CheckCircle2 size={18} />} label="Registered"   value={users.length}  color="from-cyan-500 to-blue-500" />
+          <AdminStat icon={<Target size={18} />}     label="Online"         value={activeNow}     color="from-pink-500 to-rose-500" />
         </div>
 
-        {/* Search & Controls */}
+        {/* ── Search & sort ────────────────────────────────────────────────── */}
         <div className="flex flex-col sm:flex-row gap-3">
           <div className="flex-1 relative">
             <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
             <input
               type="text"
-              placeholder="Search by name or mobile..."
+              placeholder="Search by name or mobile…"
               value={searchQuery}
               onChange={e => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-4 py-2.5 bg-slate-800/50 border border-white/10 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-amber-500/50"
@@ -264,23 +333,26 @@ export default function AdminPanel() {
           </select>
         </div>
 
-        {/* Initial loading state */}
-        {isRefreshing && users.length === 0 && (
+        {/* ── Initial connecting spinner ───────────────────────────────────── */}
+        {isConnecting && users.length === 0 && (
           <div className="flex flex-col items-center justify-center py-20 gap-4">
             <div className="relative">
-              <div className="w-12 h-12 rounded-full border-2 border-amber-500/20 flex items-center justify-center">
-                <Loader2 size={20} className="text-amber-400 animate-spin" />
+              <div className="w-16 h-16 rounded-full border-2 border-amber-500/20 flex items-center justify-center">
+                <Loader2 size={24} className="text-amber-400 animate-spin" />
               </div>
+              <span className="absolute -bottom-1 -right-1 w-4 h-4 bg-emerald-500/20 rounded-full flex items-center justify-center">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              </span>
             </div>
             <div className="text-center">
-              <p className="text-white font-medium">Loading students from Firestore…</p>
-              <p className="text-slate-400 text-sm mt-1">Fetching all registered student data</p>
+              <p className="text-white font-medium">Connecting to Firestore…</p>
+              <p className="text-slate-400 text-sm mt-1">Setting up real-time listener for all students</p>
             </div>
           </div>
         )}
 
-        {/* Users list */}
-        {!isRefreshing || users.length > 0 ? (
+        {/* ── Students list ─────────────────────────────────────────────────── */}
+        {(!isConnecting || users.length > 0) && (
           filteredUsers.length === 0 ? (
             <div className="text-center py-16 bg-slate-800/30 rounded-2xl border border-white/5">
               <Users className="mx-auto mb-3 text-slate-600" size={40} />
@@ -288,137 +360,32 @@ export default function AdminPanel() {
                 {users.length === 0 ? 'No registered students yet' : 'No students match your search'}
               </p>
               {users.length === 0 && (
-                <p className="text-slate-500 text-sm mt-2">Students will appear here once they register</p>
+                <p className="text-slate-500 text-sm mt-2">Students will appear here in real-time once they register</p>
               )}
             </div>
           ) : (
             <div className="space-y-2">
-              {filteredUsers.map((user) => {
+              {filteredUsers.map(user => {
                 const isExpanded = expandedUser === user.id;
-                const isLoadingThis = loadingUserId === user.id;
-
                 return (
-                  <div
+                  <StudentRow
                     key={user.id}
-                    className="bg-slate-800/50 rounded-xl border border-white/5 hover:border-white/10 transition-all overflow-hidden"
-                  >
-                    {/* User Row */}
-                    <div className="flex items-center gap-3 p-4">
-                      <div className={cn(
-                        'w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold text-white flex-shrink-0',
-                        user.isLoggedIn
-                          ? 'bg-gradient-to-br from-emerald-500 to-teal-600'
-                          : 'bg-gradient-to-br from-slate-600 to-slate-700'
-                      )}>
-                        {user.name.charAt(0).toUpperCase()}
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <p className="text-sm font-semibold text-white truncate">{user.name}</p>
-                          {user.isLoggedIn && (
-                            <span className="flex items-center gap-1 text-[10px] bg-emerald-500/15 text-emerald-400 px-1.5 py-0.5 rounded-full border border-emerald-500/20">
-                              <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                              Online
-                            </span>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-3 mt-0.5">
-                          <span className="text-xs text-slate-400 flex items-center gap-1">
-                            <Phone size={10} />
-                            +91 {user.mobile}
-                          </span>
-                          <span className="text-xs text-slate-500">
-                            Joined {format(parseISO(user.createdAt), 'MMM d, yyyy')}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-1">
-                        <button
-                          onClick={() => handleViewDetail(user.id)}
-                          className="p-2 rounded-lg text-slate-500 hover:text-amber-400 hover:bg-amber-500/10 transition-colors"
-                          title="View full details from cloud"
-                        >
-                          <Eye size={15} />
-                        </button>
-                        <button
-                          onClick={() => setShowDeleteConfirm(user.id)}
-                          className="p-2 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-colors"
-                          title="Delete user"
-                        >
-                          <Trash2 size={15} />
-                        </button>
-                        <button
-                          onClick={() => handleExpandUser(user.id)}
-                          className="p-2 rounded-lg text-slate-500 hover:text-white hover:bg-slate-700/50 transition-colors"
-                        >
-                          {isExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Expanded Quick View */}
-                    {isExpanded && (
-                      <div className="px-4 pb-4 border-t border-white/5 pt-3 animate-fade-in">
-                        {isLoadingThis ? (
-                          <div className="flex items-center justify-center gap-3 py-6">
-                            <Loader2 size={16} className="text-amber-400 animate-spin" />
-                            <span className="text-sm text-slate-400">Fetching data from Firestore…</span>
-                          </div>
-                        ) : expandedPerf ? (
-                          <>
-                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-                              <MiniStat label="Study Time" value={`${Math.round(expandedPerf.totalStudyMin)}m`} icon={<Clock size={13} />} />
-                              <MiniStat label="Tasks" value={`${expandedPerf.completedTasks}/${expandedPerf.totalTasks}`} icon={<CheckCircle2 size={13} />} />
-                              <MiniStat label="Sessions" value={`${expandedPerf.totalSessions}`} icon={<Target size={13} />} />
-                              <MiniStat label="Streak" value={`${expandedPerf.streak}d`} icon={<Flame size={13} />} />
-                            </div>
-                            <div className="flex flex-wrap gap-3 p-3 bg-slate-900/50 rounded-lg mb-3">
-                              <div className="flex items-center gap-1.5">
-                                <Phone size={12} className="text-slate-500" />
-                                <span className="text-xs text-slate-300 font-mono">{user.mobile}</span>
-                              </div>
-                              <div className="flex items-center gap-1.5">
-                                <Lock size={12} className="text-slate-500" />
-                                <span className="text-xs text-slate-300 font-mono tracking-widest">{user.password}</span>
-                              </div>
-                              <div className="flex items-center gap-1.5">
-                                <Calendar size={12} className="text-slate-500" />
-                                <span className="text-xs text-slate-400">
-                                  Last login: {format(parseISO(user.lastLoginAt), 'MMM d, h:mm a')}
-                                </span>
-                              </div>
-                            </div>
-                            <div className="flex items-end gap-1 h-16">
-                              {expandedPerf.last7.map((d, i) => {
-                                const maxMins = Math.max(...expandedPerf.last7.map(x => x.mins), 1);
-                                return (
-                                  <div key={i} className="flex-1 flex flex-col items-center gap-0.5">
-                                    <div className="w-full bg-slate-700/30 rounded-t relative" style={{ height: '48px' }}>
-                                      <div
-                                        className="absolute bottom-0 w-full bg-gradient-to-t from-amber-600 to-amber-400 rounded-t transition-all"
-                                        style={{ height: `${(d.mins / maxMins) * 100}%` }}
-                                      />
-                                    </div>
-                                    <span className="text-[9px] text-slate-500">{d.day}</span>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          </>
-                        ) : (
-                          <p className="text-center py-4 text-sm text-slate-500">No data available for this student</p>
-                        )}
-                      </div>
-                    )}
-                  </div>
+                    user={user}
+                    isExpanded={isExpanded}
+                    expandedPerf={isExpanded ? expandedPerf : null}
+                    expandedLoading={isExpanded ? expandedLoading : false}
+                    onToggleExpand={() => handleExpandUser(user.id)}
+                    onViewDetail={() => handleViewDetail(user.id)}
+                    onDelete={() => setShowDeleteConfirm(user.id)}
+                  />
                 );
               })}
             </div>
           )
-        ) : null}
+        )}
       </div>
 
-      {/* Delete Confirmation Modal */}
+      {/* ── Delete confirm ──────────────────────────────────────────────────── */}
       {showDeleteConfirm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
           <div className="w-full max-w-sm bg-slate-900 rounded-2xl border border-white/10 p-6 animate-fade-in">
@@ -428,13 +395,11 @@ export default function AdminPanel() {
               </div>
               <div>
                 <h3 className="text-lg font-semibold text-white">Delete Student</h3>
-                <p className="text-xs text-slate-400">
-                  {users.find(u => u.id === showDeleteConfirm)?.name}
-                </p>
+                <p className="text-xs text-slate-400">{users.find(u => u.id === showDeleteConfirm)?.name}</p>
               </div>
             </div>
             <p className="text-sm text-slate-300 mb-5">
-              This will permanently delete this student account and all their study data from the cloud. This action cannot be undone.
+              This will permanently delete this student and all their study data from the cloud. This cannot be undone.
             </p>
             <div className="flex gap-3">
               <button
@@ -447,28 +412,161 @@ export default function AdminPanel() {
                 onClick={() => handleDeleteUser(showDeleteConfirm)}
                 className="flex-1 py-2.5 bg-red-600 rounded-xl text-sm text-white font-medium hover:bg-red-500"
               >
-                Delete Student
+                Delete
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Full Student Detail Modal */}
+      {/* ── Detail modal ────────────────────────────────────────────────────── */}
       {selectedUser && (
         <UserDetailModal
           user={selectedUser}
           perf={selectedPerf}
-          isLoading={loadingUserId === selectedUser.id}
-          onClose={() => { setSelectedUserDetail(null); setSelectedPerf(null); }}
+          isLoading={selectedLoading}
+          onClose={() => setSelectedUserDetail(null)}
         />
       )}
     </div>
   );
 }
 
-// ===== Sub-components =====
+// ─── StudentRow ──────────────────────────────────────────────────────────────
+function StudentRow({
+  user,
+  isExpanded,
+  expandedPerf,
+  expandedLoading,
+  onToggleExpand,
+  onViewDetail,
+  onDelete,
+}: {
+  user: User;
+  isExpanded: boolean;
+  expandedPerf: UserPerfData | null;
+  expandedLoading: boolean;
+  onToggleExpand: () => void;
+  onViewDetail: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="bg-slate-800/50 rounded-xl border border-white/5 hover:border-white/10 transition-all overflow-hidden">
+      {/* Row header */}
+      <div className="flex items-center gap-3 p-4">
+        <div className={cn(
+          'w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold text-white flex-shrink-0',
+          user.isLoggedIn
+            ? 'bg-gradient-to-br from-emerald-500 to-teal-600'
+            : 'bg-gradient-to-br from-slate-600 to-slate-700'
+        )}>
+          {user.name.charAt(0).toUpperCase()}
+        </div>
 
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <p className="text-sm font-semibold text-white truncate">{user.name}</p>
+            {user.isLoggedIn && (
+              <span className="flex items-center gap-1 text-[10px] bg-emerald-500/15 text-emerald-400 px-1.5 py-0.5 rounded-full border border-emerald-500/20">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                Online
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-3 mt-0.5">
+            <span className="text-xs text-slate-400 flex items-center gap-1">
+              <Phone size={10} /> +91 {user.mobile}
+            </span>
+            <span className="text-xs text-slate-500">
+              Joined {format(parseISO(user.createdAt), 'MMM d, yyyy')}
+            </span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1">
+          <button
+            onClick={onViewDetail}
+            className="p-2 rounded-lg text-slate-500 hover:text-amber-400 hover:bg-amber-500/10 transition-colors"
+            title="View full details (live)"
+          >
+            <Eye size={15} />
+          </button>
+          <button
+            onClick={onDelete}
+            className="p-2 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+            title="Delete student"
+          >
+            <Trash2 size={15} />
+          </button>
+          <button
+            onClick={onToggleExpand}
+            className="p-2 rounded-lg text-slate-500 hover:text-white hover:bg-slate-700/50 transition-colors"
+          >
+            {isExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+          </button>
+        </div>
+      </div>
+
+      {/* Expanded quick view */}
+      {isExpanded && (
+        <div className="px-4 pb-4 border-t border-white/5 pt-3 animate-fade-in">
+          {expandedLoading ? (
+            <div className="flex items-center justify-center gap-3 py-6">
+              <Loader2 size={16} className="text-amber-400 animate-spin" />
+              <span className="text-sm text-slate-400">Fetching live data…</span>
+            </div>
+          ) : expandedPerf ? (
+            <>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+                <MiniStat label="Study Time"  value={`${Math.round(expandedPerf.totalStudyMin)}m`} icon={<Clock size={13} />} />
+                <MiniStat label="Tasks"       value={`${expandedPerf.completedTasks}/${expandedPerf.totalTasks}`} icon={<CheckCircle2 size={13} />} />
+                <MiniStat label="Sessions"    value={`${expandedPerf.totalSessions}`}  icon={<Target size={13} />} />
+                <MiniStat label="Streak"      value={`${expandedPerf.streak}d`}       icon={<Flame size={13} />} />
+              </div>
+              <div className="flex flex-wrap gap-3 p-3 bg-slate-900/50 rounded-lg mb-3">
+                <div className="flex items-center gap-1.5">
+                  <Phone size={12} className="text-slate-500" />
+                  <span className="text-xs text-slate-300 font-mono">{user.mobile}</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <Lock size={12} className="text-slate-500" />
+                  <span className="text-xs text-slate-300 font-mono tracking-widest">{user.password}</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <Calendar size={12} className="text-slate-500" />
+                  <span className="text-xs text-slate-400">
+                    Last login: {format(parseISO(user.lastLoginAt), 'MMM d, h:mm a')}
+                  </span>
+                </div>
+              </div>
+              {/* 7-day mini chart */}
+              <div className="flex items-end gap-1 h-16">
+                {expandedPerf.last7.map((d, i) => {
+                  const maxMins = Math.max(...expandedPerf.last7.map(x => x.mins), 1);
+                  return (
+                    <div key={i} className="flex-1 flex flex-col items-center gap-0.5">
+                      <div className="w-full bg-slate-700/30 rounded-t relative" style={{ height: '48px' }}>
+                        <div
+                          className="absolute bottom-0 w-full bg-gradient-to-t from-amber-600 to-amber-400 rounded-t transition-all"
+                          style={{ height: `${(d.mins / maxMins) * 100}%` }}
+                        />
+                      </div>
+                      <span className="text-[9px] text-slate-500">{d.day}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          ) : (
+            <p className="text-center py-4 text-sm text-slate-500">No study data yet for this student</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Sub-components ───────────────────────────────────────────────────────────
 function AdminStat({ icon, label, value, color }: { icon: React.ReactNode; label: string; value: number | string; color: string }) {
   return (
     <div className="bg-slate-800/50 rounded-xl border border-white/5 p-4">
@@ -505,6 +603,7 @@ interface UserPerfData {
   sessions: StudySession[];
 }
 
+// ─── UserDetailModal ──────────────────────────────────────────────────────────
 function UserDetailModal({
   user,
   perf,
@@ -522,6 +621,7 @@ function UserDetailModal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm overflow-y-auto">
       <div className="w-full max-w-2xl bg-slate-900 rounded-2xl border border-white/10 shadow-2xl my-8 animate-fade-in">
+
         {/* Header */}
         <div className="flex items-center gap-4 p-6 border-b border-white/5">
           <div className={cn(
@@ -540,6 +640,11 @@ function UserDetailModal({
                   Online
                 </span>
               )}
+              {/* Live indicator on modal */}
+              <span className="flex items-center gap-1 text-[10px] bg-violet-500/15 text-violet-400 px-2 py-0.5 rounded-full border border-violet-500/20">
+                <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-pulse" />
+                Live data
+              </span>
             </div>
             <div className="flex items-center gap-4 mt-1">
               <span className="text-xs text-slate-400 flex items-center gap-1">
@@ -555,7 +660,7 @@ function UserDetailModal({
           </button>
         </div>
 
-        {/* User Meta */}
+        {/* Meta */}
         <div className="px-6 py-3 bg-slate-800/30 border-b border-white/5 flex flex-wrap gap-4 text-xs text-slate-400">
           <span className="flex items-center gap-1"><Calendar size={11} /> Joined: {format(parseISO(user.createdAt), 'MMM d, yyyy')}</span>
           <span className="flex items-center gap-1"><Clock size={11} /> Last Login: {format(parseISO(user.lastLoginAt), 'MMM d, yyyy h:mm a')}</span>
@@ -567,8 +672,8 @@ function UserDetailModal({
           <div className="flex flex-col items-center justify-center py-20 gap-4">
             <Loader2 size={28} className="text-amber-400 animate-spin" />
             <div className="text-center">
-              <p className="text-white font-medium">Loading student data…</p>
-              <p className="text-slate-400 text-sm mt-1">Fetching goals, tasks & sessions from Firestore</p>
+              <p className="text-white font-medium">Connecting live data stream…</p>
+              <p className="text-slate-400 text-sm mt-1">Fetching tasks, sessions & goals from Firestore</p>
             </div>
           </div>
         ) : (
@@ -601,163 +706,195 @@ function UserDetailModal({
               ))}
             </div>
 
-            {/* Content */}
+            {/* Tab content */}
             <div className="p-6 max-h-[60vh] overflow-y-auto">
               {!perf ? (
-                <div className="flex items-center justify-center py-16">
-                  <span className="text-sm text-slate-400">No data available for this student</span>
+                <div className="text-center py-16">
+                  <p className="text-sm text-slate-400">No study data available for this student yet</p>
                 </div>
               ) : tab === 'overview' ? (
-                <div className="space-y-6">
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                    <div className="p-3 bg-violet-500/10 border border-violet-500/20 rounded-xl text-center">
-                      <p className="text-xl font-bold text-white">{Math.round(perf.totalStudyMin)}m</p>
-                      <p className="text-[10px] text-slate-400">Total Study</p>
-                    </div>
-                    <div className="p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl text-center">
-                      <p className="text-xl font-bold text-white">{perf.completedTasks}/{perf.totalTasks}</p>
-                      <p className="text-[10px] text-slate-400">Tasks Done</p>
-                    </div>
-                    <div className="p-3 bg-cyan-500/10 border border-cyan-500/20 rounded-xl text-center">
-                      <p className="text-xl font-bold text-white">{perf.totalSessions}</p>
-                      <p className="text-[10px] text-slate-400">Sessions</p>
-                    </div>
-                    <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl text-center">
-                      <p className="text-xl font-bold text-white">{perf.streak}d</p>
-                      <p className="text-[10px] text-slate-400">Streak</p>
-                    </div>
-                  </div>
-
-                  <div className="p-4 bg-slate-800/30 rounded-xl">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-sm text-slate-300">Task Completion Rate</span>
-                      <span className="text-sm font-bold text-white">{Math.round(perf.completionRate)}%</span>
-                    </div>
-                    <div className="w-full h-3 bg-slate-700/50 rounded-full overflow-hidden">
-                      <div className="h-full bg-gradient-to-r from-emerald-500 to-teal-500 rounded-full transition-all duration-700" style={{ width: `${perf.completionRate}%` }} />
-                    </div>
-                  </div>
-
-                  <div>
-                    <h4 className="text-sm font-medium text-slate-300 mb-3">Last 7 Days Activity</h4>
-                    <div className="flex items-end gap-2 h-32">
-                      {perf.last7.map((d, i) => {
-                        const maxMins = Math.max(...perf.last7.map(x => x.mins), 1);
-                        return (
-                          <div key={i} className="flex-1 flex flex-col items-center gap-1">
-                            <span className="text-[10px] text-slate-500">{d.mins > 0 ? `${d.mins}m` : ''}</span>
-                            <div className="w-full bg-slate-700/30 rounded-t relative" style={{ height: '100px' }}>
-                              <div className="absolute bottom-0 w-full bg-gradient-to-t from-amber-600 to-amber-400 rounded-t transition-all" style={{ height: `${(d.mins / maxMins) * 100}%` }} />
-                            </div>
-                            <span className="text-[10px] text-slate-500">{d.day}</span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  {perf.categories.length > 0 && (
-                    <div>
-                      <h4 className="text-sm font-medium text-slate-300 mb-3">Study by Category</h4>
-                      <div className="space-y-2">
-                        {perf.categories.map((cat, i) => {
-                          const totalCatMins = perf.categories.reduce((a, c) => a + c.mins, 0) || 1;
-                          return (
-                            <div key={cat.name}>
-                              <div className="flex items-center justify-between mb-1">
-                                <span className="text-xs text-white">{cat.name}</span>
-                                <span className="text-[11px] text-slate-400">{cat.mins}m ({Math.round((cat.mins / totalCatMins) * 100)}%)</span>
-                              </div>
-                              <div className="w-full h-2 bg-slate-700/50 rounded-full overflow-hidden">
-                                <div className={cn('h-full rounded-full', catColors[i % catColors.length])} style={{ width: `${(cat.mins / totalCatMins) * 100}%` }} />
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-
-                  <div>
-                    <h4 className="text-sm font-medium text-slate-300 mb-3">Task Priorities</h4>
-                    <div className="flex gap-3">
-                      {([
-                        ['urgent', 'Urgent', 'bg-red-500/15 text-red-400 border-red-500/20'],
-                        ['high',   'High',   'bg-amber-500/15 text-amber-400 border-amber-500/20'],
-                        ['medium', 'Medium', 'bg-blue-500/15 text-blue-400 border-blue-500/20'],
-                        ['low',    'Low',    'bg-slate-500/15 text-slate-400 border-slate-500/20'],
-                      ] as const).map(([key, label, cls]) => (
-                        <div key={key} className={cn('flex-1 p-2.5 rounded-lg border text-center', cls)}>
-                          <p className="text-lg font-bold">{perf.priorities[key]}</p>
-                          <p className="text-[10px] opacity-80">{label}</p>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
+                <OverviewTab perf={perf} catColors={catColors} />
               ) : tab === 'tasks' ? (
-                <div className="space-y-2">
-                  {perf.tasks.length === 0 ? (
-                    <div className="text-center py-12">
-                      <ListTodo size={32} className="mx-auto mb-3 text-slate-600" />
-                      <p className="text-slate-500 text-sm">No tasks created yet</p>
-                    </div>
-                  ) : (
-                    perf.tasks.map(task => (
-                      <div key={task.id} className="p-3 bg-slate-800/30 rounded-lg border border-white/5">
-                        <div className="flex items-start gap-2">
-                          {task.status === 'completed'
-                            ? <CheckCircle2 size={14} className="text-emerald-400 mt-0.5 flex-shrink-0" />
-                            : <ListTodo size={14} className="text-slate-500 mt-0.5 flex-shrink-0" />
-                          }
-                          <div className="flex-1 min-w-0">
-                            <p className={cn('text-sm', task.status === 'completed' ? 'text-slate-400 line-through' : 'text-white')}>{task.title}</p>
-                            <div className="flex items-center gap-2 mt-1 flex-wrap">
-                              <span className="text-[10px] bg-slate-700/50 text-slate-400 px-1.5 py-0.5 rounded">{task.category}</span>
-                              <span className={cn('text-[10px] px-1.5 py-0.5 rounded', {
-                                'bg-red-500/20 text-red-300':    task.priority === 'urgent',
-                                'bg-amber-500/20 text-amber-300': task.priority === 'high',
-                                'bg-blue-500/20 text-blue-300':  task.priority === 'medium',
-                                'bg-slate-500/20 text-slate-300': task.priority === 'low',
-                              })}>{task.priority}</span>
-                              <span className="text-[10px] text-slate-500">{task.status}</span>
-                              {task.dueDate && (
-                                <span className="text-[10px] text-slate-500">Due: {format(parseISO(task.dueDate), 'MMM d')}</span>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
+                <TasksTab tasks={perf.tasks} />
               ) : (
-                <div className="space-y-2">
-                  {perf.sessions.length === 0 ? (
-                    <div className="text-center py-12">
-                      <Clock size={32} className="mx-auto mb-3 text-slate-600" />
-                      <p className="text-slate-500 text-sm">No study sessions yet</p>
-                    </div>
-                  ) : (
-                    perf.sessions.slice(0, 50).map(session => (
-                      <div key={session.id} className="flex items-center gap-3 p-3 bg-slate-800/30 rounded-lg border border-white/5">
-                        <div className="w-8 h-8 rounded-lg bg-amber-500/15 flex items-center justify-center flex-shrink-0">
-                          <GraduationCap size={14} className="text-amber-400" />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-xs font-medium text-white">{session.category}</p>
-                          <p className="text-[10px] text-slate-500">{format(parseISO(session.startTime), 'MMM d, yyyy · h:mm a')}</p>
-                        </div>
-                        <span className="text-sm font-medium text-slate-300">{Math.round(session.duration / 60)}m</span>
-                      </div>
-                    ))
-                  )}
-                </div>
+                <SessionsTab sessions={perf.sessions} />
               )}
             </div>
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─── Tab sub-components ───────────────────────────────────────────────────────
+function OverviewTab({ perf, catColors }: { perf: UserPerfData; catColors: string[] }) {
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <StatCard value={`${Math.round(perf.totalStudyMin)}m`}        label="Total Study"  color="violet" />
+        <StatCard value={`${perf.completedTasks}/${perf.totalTasks}`} label="Tasks Done"   color="emerald" />
+        <StatCard value={`${perf.totalSessions}`}                     label="Sessions"     color="cyan" />
+        <StatCard value={`${perf.streak}d`}                           label="Streak"       color="amber" />
+      </div>
+
+      <div className="p-4 bg-slate-800/30 rounded-xl">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-sm text-slate-300">Task Completion Rate</span>
+          <span className="text-sm font-bold text-white">{Math.round(perf.completionRate)}%</span>
+        </div>
+        <div className="w-full h-3 bg-slate-700/50 rounded-full overflow-hidden">
+          <div
+            className="h-full bg-gradient-to-r from-emerald-500 to-teal-500 rounded-full transition-all duration-700"
+            style={{ width: `${perf.completionRate}%` }}
+          />
+        </div>
+      </div>
+
+      <div>
+        <h4 className="text-sm font-medium text-slate-300 mb-3">Last 7 Days Activity</h4>
+        <div className="flex items-end gap-2 h-32">
+          {perf.last7.map((d, i) => {
+            const maxMins = Math.max(...perf.last7.map(x => x.mins), 1);
+            return (
+              <div key={i} className="flex-1 flex flex-col items-center gap-1">
+                <span className="text-[10px] text-slate-500">{d.mins > 0 ? `${d.mins}m` : ''}</span>
+                <div className="w-full bg-slate-700/30 rounded-t relative" style={{ height: '100px' }}>
+                  <div
+                    className="absolute bottom-0 w-full bg-gradient-to-t from-amber-600 to-amber-400 rounded-t transition-all"
+                    style={{ height: `${(d.mins / maxMins) * 100}%` }}
+                  />
+                </div>
+                <span className="text-[10px] text-slate-500">{d.day}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {perf.categories.length > 0 && (
+        <div>
+          <h4 className="text-sm font-medium text-slate-300 mb-3">Study by Category</h4>
+          <div className="space-y-2">
+            {perf.categories.map((cat, i) => {
+              const total = perf.categories.reduce((a, c) => a + c.mins, 0) || 1;
+              return (
+                <div key={cat.name}>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-xs text-white">{cat.name}</span>
+                    <span className="text-[11px] text-slate-400">{cat.mins}m ({Math.round((cat.mins / total) * 100)}%)</span>
+                  </div>
+                  <div className="w-full h-2 bg-slate-700/50 rounded-full overflow-hidden">
+                    <div className={cn('h-full rounded-full', catColors[i % catColors.length])} style={{ width: `${(cat.mins / total) * 100}%` }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      <div>
+        <h4 className="text-sm font-medium text-slate-300 mb-3">Task Priorities</h4>
+        <div className="flex gap-3">
+          {([
+            ['urgent', 'Urgent', 'bg-red-500/15 text-red-400 border-red-500/20'],
+            ['high',   'High',   'bg-amber-500/15 text-amber-400 border-amber-500/20'],
+            ['medium', 'Medium', 'bg-blue-500/15 text-blue-400 border-blue-500/20'],
+            ['low',    'Low',    'bg-slate-500/15 text-slate-400 border-slate-500/20'],
+          ] as const).map(([key, label, cls]) => (
+            <div key={key} className={cn('flex-1 p-2.5 rounded-lg border text-center', cls)}>
+              <p className="text-lg font-bold">{perf.priorities[key]}</p>
+              <p className="text-[10px] opacity-80">{label}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TasksTab({ tasks }: { tasks: Task[] }) {
+  if (tasks.length === 0) {
+    return (
+      <div className="text-center py-12">
+        <ListTodo size={32} className="mx-auto mb-3 text-slate-600" />
+        <p className="text-slate-500 text-sm">No tasks created yet</p>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      {tasks.map(task => (
+        <div key={task.id} className="p-3 bg-slate-800/30 rounded-lg border border-white/5">
+          <div className="flex items-start gap-2">
+            {task.status === 'completed'
+              ? <CheckCircle2 size={14} className="text-emerald-400 mt-0.5 flex-shrink-0" />
+              : <ListTodo size={14} className="text-slate-500 mt-0.5 flex-shrink-0" />
+            }
+            <div className="flex-1 min-w-0">
+              <p className={cn('text-sm', task.status === 'completed' ? 'text-slate-400 line-through' : 'text-white')}>
+                {task.title}
+              </p>
+              <div className="flex items-center gap-2 mt-1 flex-wrap">
+                <span className="text-[10px] bg-slate-700/50 text-slate-400 px-1.5 py-0.5 rounded">{task.category}</span>
+                <span className={cn('text-[10px] px-1.5 py-0.5 rounded', {
+                  'bg-red-500/20 text-red-300':     task.priority === 'urgent',
+                  'bg-amber-500/20 text-amber-300':  task.priority === 'high',
+                  'bg-blue-500/20 text-blue-300':    task.priority === 'medium',
+                  'bg-slate-500/20 text-slate-300':  task.priority === 'low',
+                })}>{task.priority}</span>
+                <span className="text-[10px] text-slate-500">{task.status}</span>
+                {task.dueDate && (
+                  <span className="text-[10px] text-slate-500">Due: {format(parseISO(task.dueDate), 'MMM d')}</span>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SessionsTab({ sessions }: { sessions: StudySession[] }) {
+  if (sessions.length === 0) {
+    return (
+      <div className="text-center py-12">
+        <Clock size={32} className="mx-auto mb-3 text-slate-600" />
+        <p className="text-slate-500 text-sm">No study sessions yet</p>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      {sessions.slice(0, 50).map(session => (
+        <div key={session.id} className="flex items-center gap-3 p-3 bg-slate-800/30 rounded-lg border border-white/5">
+          <div className="w-8 h-8 rounded-lg bg-amber-500/15 flex items-center justify-center flex-shrink-0">
+            <GraduationCap size={14} className="text-amber-400" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-xs font-medium text-white">{session.category}</p>
+            <p className="text-[10px] text-slate-500">{format(parseISO(session.startTime), 'MMM d, yyyy · h:mm a')}</p>
+          </div>
+          <span className="text-sm font-medium text-slate-300">{Math.round(session.duration / 60)}m</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function StatCard({ value, label, color }: { value: string; label: string; color: 'violet' | 'emerald' | 'cyan' | 'amber' }) {
+  const colors = {
+    violet:  'bg-violet-500/10 border-violet-500/20',
+    emerald: 'bg-emerald-500/10 border-emerald-500/20',
+    cyan:    'bg-cyan-500/10 border-cyan-500/20',
+    amber:   'bg-amber-500/10 border-amber-500/20',
+  };
+  return (
+    <div className={cn('p-3 border rounded-xl text-center', colors[color])}>
+      <p className="text-xl font-bold text-white">{value}</p>
+      <p className="text-[10px] text-slate-400">{label}</p>
     </div>
   );
 }

@@ -1,6 +1,6 @@
 import { db } from '../firebase';
 import {
-  doc, getDoc, setDoc, deleteDoc, collection, getDocs
+  doc, getDoc, setDoc, deleteDoc, collection, getDocs, onSnapshot
 } from 'firebase/firestore';
 import type { User } from '../types';
 
@@ -116,6 +116,57 @@ export async function cloudPullAppData(userId: string): Promise<any | null> {
     logFail('getDoc', path, e);
     return null;
   }
+}
+
+// --- REAL-TIME SUBSCRIPTIONS (onSnapshot) ---
+
+/**
+ * Subscribe to the entire users collection.
+ * Fires immediately with the current snapshot, then on every change.
+ * Returns an unsubscribe function — call it in useEffect cleanup.
+ */
+export function subscribeToUsers(
+  onData: (users: User[]) => void,
+  onErr?: (err: Error) => void
+): () => void {
+  const path = 'users (collection)';
+  console.log(`${TAG} ▶ onSnapshot → ${path} [LIVE]`);
+  return onSnapshot(
+    collection(db, 'users'),
+    (snap) => {
+      console.log(`${TAG} ✅ onSnapshot update → ${path} (${snap.docs.length} docs)`);
+      onData(snap.docs.map(d => d.data() as User));
+    },
+    (err) => {
+      logFail('onSnapshot', path, err);
+      onErr?.(err);
+    }
+  );
+}
+
+/**
+ * Subscribe to a single student's appData document.
+ * Fires immediately and on every task/session/settings change.
+ * Returns an unsubscribe function — call it in useEffect cleanup.
+ */
+export function subscribeToAppData(
+  userId: string,
+  onData: (data: { tasks: any[]; sessions: any[]; settings: any } | null) => void,
+  onErr?: (err: Error) => void
+): () => void {
+  const path = `appData/${userId}`;
+  console.log(`${TAG} ▶ onSnapshot → ${path} [LIVE]`);
+  return onSnapshot(
+    doc(db, 'appData', userId),
+    (snap) => {
+      console.log(`${TAG} ✅ onSnapshot update → ${path}`);
+      onData(snap.exists() ? (snap.data() as any) : null);
+    },
+    (err) => {
+      logFail('onSnapshot', path, err);
+      onErr?.(err);
+    }
+  );
 }
 
 // --- CONNECTION + WRITE TEST ---
