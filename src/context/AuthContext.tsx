@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useMemo, useEffect } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import type { User, AuthSession, Task, StudySession } from '../types';
-import { cloudSyncUser, cloudDeleteUser, cloudPullUsers } from '../services/database';
+import { cloudSyncUser, cloudDeleteUser, cloudPullUsers, cloudPullAppData } from '../services/database';
 
 const ADMIN_PASSKEY = import.meta.env.VITE_ADMIN_PASSKEY || 'Kuldeep Singh';
 const SESSION_KEY = 'sf-session';
@@ -41,6 +41,8 @@ interface AuthContextType {
   getAllUsers: () => User[];
   getUserData: (userId: string) => { tasks: Task[]; sessions: StudySession[]; settings: any };
   deleteUser: (userId: string) => void;
+  refreshUsersFromCloud: () => Promise<User[]>;
+  getUserDataFromCloud: (userId: string) => Promise<{ tasks: Task[]; sessions: StudySession[]; settings: any }>;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -223,12 +225,61 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     cloudDeleteUser(userId); // background
   }, []);
 
+  // ADMIN: pull all users from Firestore, merge with local, return merged list
+  const refreshUsersFromCloud = useCallback(async (): Promise<User[]> => {
+    const cloudUsers = await cloudPullUsers();
+    const local = getUsers();
+    if (!cloudUsers || cloudUsers.length === 0) return local;
+
+    const localIds = new Set(local.map(u => u.id));
+    const localMobiles = new Set(local.map(u => u.mobile));
+    const merged = [...local];
+
+    for (const cu of cloudUsers) {
+      if (!localIds.has(cu.id) && !localMobiles.has(cu.mobile)) {
+        merged.push(cu);
+      } else {
+        const idx = merged.findIndex(u => u.id === cu.id || u.mobile === cu.mobile);
+        if (idx !== -1) {
+          const localUser = merged[idx];
+          const cloudNewer = cu.lastLoginAt && localUser.lastLoginAt
+            ? new Date(cu.lastLoginAt) > new Date(localUser.lastLoginAt)
+            : false;
+          if (cloudNewer) merged[idx] = { ...cu };
+        }
+      }
+    }
+
+    saveUsers(merged);
+    return merged;
+  }, []);
+
+  // ADMIN: get a specific student's tasks/sessions/settings from Firestore
+  const getUserDataFromCloud = useCallback(async (userId: string): Promise<{ tasks: Task[]; sessions: StudySession[]; settings: any }> => {
+    const cloud = await cloudPullAppData(userId);
+
+    const tasks: Task[] = cloud?.tasks ?? ls(`sf-tasks-${userId}`) ?? [];
+    const sessions: StudySession[] = cloud?.sessions ?? ls(`sf-sessions-${userId}`) ?? [];
+    const settings = cloud?.settings ?? ls(`sf-settings-${userId}`) ?? {};
+
+    // Write back to localStorage so subsequent local reads are warm
+    if (cloud) {
+      lsSet(`sf-tasks-${userId}`, tasks);
+      lsSet(`sf-sessions-${userId}`, sessions);
+      lsSet(`sf-settings-${userId}`, settings);
+    }
+
+    return { tasks, sessions, settings };
+  }, []);
+
   const value = useMemo(() => ({
     session, isAuthenticated, isAdmin, authPage, setAuthPage, isLoading,
     register, login, adminLogin, logout,
     getAllUsers, getUserData, deleteUser,
+    refreshUsersFromCloud, getUserDataFromCloud,
   }), [session, isAuthenticated, isAdmin, authPage, setAuthPage, isLoading,
-    register, login, adminLogin, logout, getAllUsers, getUserData, deleteUser]);
+    register, login, adminLogin, logout, getAllUsers, getUserData, deleteUser,
+    refreshUsersFromCloud, getUserDataFromCloud]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
