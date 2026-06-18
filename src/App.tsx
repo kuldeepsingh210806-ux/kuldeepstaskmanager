@@ -8,6 +8,7 @@ import CalendarView from './components/CalendarView';
 import Statistics from './components/Statistics';
 import Settings from './components/Settings';
 import AISection from './components/AISection';
+import FlashcardSection from './components/FlashcardSection';
 import LoginPage from './components/auth/LoginPage';
 import RegisterPage from './components/auth/RegisterPage';
 import AdminPanel from './components/admin/AdminPanel';
@@ -51,7 +52,7 @@ function AuthGate() {
 
 function MainApp() {
   const { currentView } = useApp();
-  const isAI = currentView === 'ai';
+  const isFullScreen = currentView === 'ai' || currentView === 'flashcards';
 
   const renderView = () => {
     switch (currentView) {
@@ -62,6 +63,7 @@ function MainApp() {
       case 'statistics': return <Statistics />;
       case 'settings':   return <Settings />;
       case 'ai':         return <AISection />;
+      case 'flashcards': return <FlashcardSection />;
       default:           return <Dashboard />;
     }
   };
@@ -69,8 +71,8 @@ function MainApp() {
   return (
     <div className="flex h-screen bg-[#0B0F19] overflow-hidden">
       <Sidebar />
-      {/* AI view: full height, no padding, no max-width — owns the entire main area */}
-      {isAI ? (
+      {/* Full-screen views (AI, Flashcards): no padding, no max-width */}
+      {isFullScreen ? (
         <main className="flex-1 flex flex-col overflow-hidden pt-12 lg:pt-0">
           {renderView()}
         </main>

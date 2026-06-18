@@ -14,6 +14,7 @@ import {
   X,
   LogOut,
   Bot,
+  Layers,
 } from 'lucide-react';
 import { useState } from 'react';
 
@@ -23,7 +24,8 @@ const navItems: { view: ViewType; label: string; icon: React.ReactNode; badge?: 
   { view: 'timer',      label: 'Study Timer',  icon: <Timer size={20} /> },
   { view: 'calendar',   label: 'Calendar',     icon: <Calendar size={20} /> },
   { view: 'statistics', label: 'Statistics',   icon: <BarChart3 size={20} /> },
-  { view: 'ai',         label: 'AI Tutor',     icon: <Bot size={20} />, badge: 'NEW' },
+  { view: 'ai',         label: 'AI Tutor',     icon: <Bot size={20} />,    badge: 'AI' },
+  { view: 'flashcards', label: 'Flashcards',   icon: <Layers size={20} />, badge: 'AI' },
   { view: 'settings',   label: 'Settings',     icon: <Settings size={20} /> },
 ];
 

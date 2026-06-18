@@ -1,7 +1,7 @@
 export type Priority = 'low' | 'medium' | 'high' | 'urgent';
 export type TaskStatus = 'todo' | 'in-progress' | 'completed';
 export type TimerMode = 'work' | 'short-break' | 'long-break';
-export type ViewType = 'dashboard' | 'tasks' | 'timer' | 'calendar' | 'statistics' | 'settings' | 'ai';
+export type ViewType = 'dashboard' | 'tasks' | 'timer' | 'calendar' | 'statistics' | 'settings' | 'ai' | 'flashcards';
 
 export interface Task {
   id: string;
