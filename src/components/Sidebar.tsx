@@ -13,16 +13,18 @@ import {
   Menu,
   X,
   LogOut,
+  Bot,
 } from 'lucide-react';
 import { useState } from 'react';
 
-const navItems: { view: ViewType; label: string; icon: React.ReactNode }[] = [
-  { view: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard size={20} /> },
-  { view: 'tasks', label: 'Tasks', icon: <ListTodo size={20} /> },
-  { view: 'timer', label: 'Study Timer', icon: <Timer size={20} /> },
-  { view: 'calendar', label: 'Calendar', icon: <Calendar size={20} /> },
-  { view: 'statistics', label: 'Statistics', icon: <BarChart3 size={20} /> },
-  { view: 'settings', label: 'Settings', icon: <Settings size={20} /> },
+const navItems: { view: ViewType; label: string; icon: React.ReactNode; badge?: string }[] = [
+  { view: 'dashboard',  label: 'Dashboard',   icon: <LayoutDashboard size={20} /> },
+  { view: 'tasks',      label: 'Tasks',        icon: <ListTodo size={20} /> },
+  { view: 'timer',      label: 'Study Timer',  icon: <Timer size={20} /> },
+  { view: 'calendar',   label: 'Calendar',     icon: <Calendar size={20} /> },
+  { view: 'statistics', label: 'Statistics',   icon: <BarChart3 size={20} /> },
+  { view: 'ai',         label: 'AI Tutor',     icon: <Bot size={20} />, badge: 'NEW' },
+  { view: 'settings',   label: 'Settings',     icon: <Settings size={20} /> },
 ];
 
 export default function Sidebar() {
@@ -80,12 +82,24 @@ export default function Sidebar() {
             className={cn(
               'w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200',
               currentView === item.view
-                ? 'bg-gradient-to-r from-violet-600/90 to-indigo-600/90 text-white shadow-lg shadow-violet-500/20'
+                ? item.view === 'ai'
+                  ? 'bg-gradient-to-r from-fuchsia-600/90 to-violet-600/90 text-white shadow-lg shadow-fuchsia-500/20'
+                  : 'bg-gradient-to-r from-violet-600/90 to-indigo-600/90 text-white shadow-lg shadow-violet-500/20'
                 : 'text-slate-400 hover:text-white hover:bg-white/5'
             )}
           >
             {item.icon}
-            {item.label}
+            <span className="flex-1 text-left">{item.label}</span>
+            {item.badge && (
+              <span className={cn(
+                'text-[9px] font-bold px-1.5 py-0.5 rounded-full',
+                currentView === item.view
+                  ? 'bg-white/20 text-white'
+                  : 'bg-fuchsia-500/20 text-fuchsia-400'
+              )}>
+                {item.badge}
+              </span>
+            )}
           </button>
         ))}
       </nav>

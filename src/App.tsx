@@ -7,6 +7,7 @@ import PomodoroTimer from './components/PomodoroTimer';
 import CalendarView from './components/CalendarView';
 import Statistics from './components/Statistics';
 import Settings from './components/Settings';
+import AISection from './components/AISection';
 import LoginPage from './components/auth/LoginPage';
 import RegisterPage from './components/auth/RegisterPage';
 import AdminPanel from './components/admin/AdminPanel';
@@ -50,27 +51,36 @@ function AuthGate() {
 
 function MainApp() {
   const { currentView } = useApp();
+  const isAI = currentView === 'ai';
 
   const renderView = () => {
     switch (currentView) {
-      case 'dashboard': return <Dashboard />;
-      case 'tasks': return <TaskManager />;
-      case 'timer': return <PomodoroTimer />;
-      case 'calendar': return <CalendarView />;
+      case 'dashboard':  return <Dashboard />;
+      case 'tasks':      return <TaskManager />;
+      case 'timer':      return <PomodoroTimer />;
+      case 'calendar':   return <CalendarView />;
       case 'statistics': return <Statistics />;
-      case 'settings': return <Settings />;
-      default: return <Dashboard />;
+      case 'settings':   return <Settings />;
+      case 'ai':         return <AISection />;
+      default:           return <Dashboard />;
     }
   };
 
   return (
     <div className="flex h-screen bg-[#0B0F19] overflow-hidden">
       <Sidebar />
-      <main className="flex-1 overflow-y-auto">
-        <div className="p-4 md:p-6 lg:p-8 pt-16 lg:pt-6 max-w-7xl mx-auto animate-fade-in">
+      {/* AI view: full height, no padding, no max-width — owns the entire main area */}
+      {isAI ? (
+        <main className="flex-1 flex flex-col overflow-hidden pt-12 lg:pt-0">
           {renderView()}
-        </div>
-      </main>
+        </main>
+      ) : (
+        <main className="flex-1 overflow-y-auto">
+          <div className="p-4 md:p-6 lg:p-8 pt-16 lg:pt-6 max-w-7xl mx-auto animate-fade-in">
+            {renderView()}
+          </div>
+        </main>
+      )}
     </div>
   );
 }
